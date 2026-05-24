@@ -17,9 +17,9 @@ ARG NGINX_IMAGE_VERSION=1.28.0
 ARG NGINX_IMAGE_HASH=39a9a15e0a81914a96fa9ffa980cdfe08e2e5e73ae3424f341ad1f470147c413
 ARG NGINX_IMAGE=nginx:${NGINX_IMAGE_VERSION}-alpine3.21-slim@sha256:${NGINX_IMAGE_HASH}
 
-FROM ${NODE_IMAGE} AS node
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS node
 
-FROM ${ALPINE_IMAGE} AS builder-base
+FROM --platform=$BUILDPLATFORM ${ALPINE_IMAGE} AS builder-base
 
 COPY --from=node /usr/lib /usr/lib
 COPY --from=node /usr/local/lib /usr/local/lib

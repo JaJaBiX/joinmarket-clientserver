@@ -24,10 +24,10 @@ ARG DINIT_IMAGE_VERSION=0.21.0
 ARG DINIT_IMAGE_HASH=6ccfeea86d3ec4bbeb557c5c7da403091713d54706ab8ccd5ae89b54baddda9d
 ARG DINIT_IMAGE=ghcr.io/joinmarket-webui/jam-contrib-dinit:${DINIT_IMAGE_VERSION}@sha256:${DINIT_IMAGE_HASH}
 
-FROM ${NODE_IMAGE} AS node
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS node
 
 # --- Builder base 
-FROM ${ALPINE_IMAGE} AS builder-base
+FROM --platform=$BUILDPLATFORM ${ALPINE_IMAGE} AS builder-base
 RUN apk add --no-cache --update git gnupg
 # --- Builder base - end
 
