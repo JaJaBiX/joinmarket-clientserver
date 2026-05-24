@@ -163,11 +163,9 @@ class JMHiddenService(object):
         self.serving_host = serving_host
         self.serving_port = serving_port
         # this is used to serve an onion from the filesystem,
-        # NB: Because of how txtorcon is set up, this option
-        # uses a *separate tor instance* owned by the owner of
-        # this script (because txtorcon needs to read the
-        # HS dir), whereas if this option is "", we set up
-        # an ephemeral HS on the global or pre-existing tor.
+        # using the same Tor control connection as ephemeral
+        # services. This keeps persistent directory nodes on the
+        # operator's configured Tor transports.
         self.hidden_service_dir = hidden_service_dir
 
     def start_tor(self):
@@ -191,16 +189,17 @@ class JMHiddenService(object):
             d.addCallback(self.onion_listen)
             d.addCallback(self.print_host)
         else:
-            ep = "onion:" + str(self.virtual_port) + ":localPort="
-            ep += str(self.serving_port)
-            # endpoints.TCPHiddenServiceEndpoint creates version 2 by
-            # default for backwards compat (err, txtorcon needs to update that ...)
-            ep += ":version=3"
-            ep += ":hiddenServiceDir="+self.hidden_service_dir
-            onion_endpoint = serverFromString(reactor, ep)
-            d = onion_endpoint.listen(self.proto_factory)
-            d.addCallback(self.print_host_filesystem)
-
+            if str(self.tor_control_host).startswith('unix:'):
+                control_endpoint = UNIXClientEndpoint(reactor,
+                                        self.tor_control_host[5:])
+            else:
+                control_endpoint = TCP4ClientEndpoint(reactor,
+                                self.tor_control_host, self.tor_control_port)
+            d = txtorcon.connect(reactor, control_endpoint)
+            d.addCallback(self.create_filesystem_onion_ep)
+            d.addErrback(self.setup_failed)
+            d.addCallback(self.onion_listen_filesystem)
+            d.addCallback(self.print_host)
 
     def setup_failed(self, arg):
         # Note that actions based on this failure are deferred to callers:
@@ -213,6 +212,16 @@ class JMHiddenService(object):
         return t.create_onion_service(
             ports=[portmap_string], private_key=txtorcon.DISCARD)
 
+    def create_filesystem_onion_ep(self, t):
+        self.tor_connection = t
+        portmap_string = config_to_hs_ports(self.virtual_port,
+                                self.serving_host, self.serving_port)
+        d = t.get_config()
+        d.addCallback(lambda config: txtorcon.FilesystemOnionService.create(
+            reactor, config, self.hidden_service_dir, [portmap_string],
+            version=3))
+        return d
+
     def onion_listen(self, onion):
         # 'onion' arg is the created EphemeralOnionService object;
         # now we know it exists, we start serving the Site on the
@@ -223,6 +232,15 @@ class JMHiddenService(object):
         onion_endpoint = serverFromString(reactor, serverstring)
         print("created the onion endpoint, now calling listen")
         return onion_endpoint.listen(self.proto_factory)
+
+    def onion_listen_filesystem(self, onion):
+        self.onion = onion
+        serverstring = "tcp:{}:interface={}".format(self.serving_port,
+                                                    self.serving_host)
+        onion_endpoint = serverFromString(reactor, serverstring)
+        d = onion_endpoint.listen(self.proto_factory)
+        d.addCallback(lambda port: onion)
+        return d
 
     def print_host(self, ep):
         """ Callback fired once the HS is available

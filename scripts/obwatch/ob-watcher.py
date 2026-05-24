@@ -768,18 +768,96 @@ class ObBasic(OrderbookWatch):
     with hooks for triggering orderbook request"""
     def __init__(self, msgchan, hostport):
         self.hostport = hostport
+        self.httpd_thread_started = False
+        self.orderbook_refresh_thread_started = False
+        self.orderbook_refresh_interval = 900
+        try:
+            self.orderbook_refresh_interval = int(os.environ.get(
+                'JM_OBWATCH_REFRESH_INTERVAL_SECONDS',
+                str(self.orderbook_refresh_interval)))
+        except ValueError:
+            log.warning('Invalid JM_OBWATCH_REFRESH_INTERVAL_SECONDS; '
+                        'using 900 seconds.')
+        self.reconnect_refresh_min_interval = 30
+        try:
+            self.reconnect_refresh_min_interval = int(os.environ.get(
+                'JM_OBWATCH_RECONNECT_REFRESH_MIN_INTERVAL_SECONDS',
+                str(self.reconnect_refresh_min_interval)))
+        except ValueError:
+            log.warning('Invalid '
+                        'JM_OBWATCH_RECONNECT_REFRESH_MIN_INTERVAL_SECONDS; '
+                        'using 30 seconds.')
+        self.last_reconnect_refresh_at = 0
         self.set_msgchan(msgchan)
         # in client-server, this is passed by client
         # in INIT message. Here, we have no Joinmarket client,
         # but we have access to the client config in this script:
         self.dust_threshold = jm_single().DUST_THRESHOLD
+        self.register_directory_connected_hook()
+        # Start HTTP endpoint even if welcome callback never arrives.
+        self.start_http_server_once()
+        self.start_orderbook_refresh_once()
+
+    def start_http_server_once(self):
+        if self.httpd_thread_started:
+            return
+        HTTPDThread(self, self.hostport).start()
+        self.httpd_thread_started = True
+
+    def register_directory_connected_hook(self):
+        channels = getattr(self.msgchan, 'mchannels', [self.msgchan])
+        for mc in channels:
+            if hasattr(mc, 'on_directory_peer_connected'):
+                mc.on_directory_peer_connected = \
+                    self.on_directory_peer_connected
+
+    def on_directory_peer_connected(self, peer):
+        if self.reconnect_refresh_min_interval < 0:
+            return
+        try:
+            peer_location = peer.peer_location()
+        except Exception:
+            peer_location = 'unknown'
+        now = time.monotonic()
+        if self.reconnect_refresh_min_interval and \
+                now - self.last_reconnect_refresh_at < \
+                self.reconnect_refresh_min_interval:
+            log.info('Skipping directory reconnect orderbook refresh for {}; '
+                     'previous refresh was recent.'.format(peer_location))
+            return
+        self.last_reconnect_refresh_at = now
+        log.info('Directory peer {} connected; requesting orderbook '
+                 'refresh.'.format(peer_location))
+        self.request_orderbook()
+
+    def start_orderbook_refresh_once(self):
+        if self.orderbook_refresh_thread_started:
+            return
+        if self.orderbook_refresh_interval <= 0:
+            log.info('Periodic orderbook refresh disabled.')
+            return
+        threading.Thread(target=self.periodic_orderbook_refresh,
+                         name='OrderbookRefreshThread',
+                         daemon=True).start()
+        self.orderbook_refresh_thread_started = True
+        log.info('Periodic orderbook refresh every {} seconds.'.format(
+            self.orderbook_refresh_interval))
+
+    def periodic_orderbook_refresh(self):
+        while True:
+            time.sleep(self.orderbook_refresh_interval)
+            try:
+                log.info('Requesting periodic orderbook refresh.')
+                self.request_orderbook()
+            except Exception as e:
+                log.warning('Periodic orderbook refresh failed: ' + repr(e))
 
     def on_welcome(self):
         """TODO: It will probably be a bit
         simpler, and more consistent, to use
         a twisted http server here instead
         of a thread."""
-        HTTPDThread(self, self.hostport).start()
+        self.start_http_server_once()
         self.request_orderbook()
 
     def request_orderbook(self):
