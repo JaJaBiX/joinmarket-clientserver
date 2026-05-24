@@ -746,6 +746,7 @@ class OnionMessageChannel(MessageChannel):
         # direct connection.
         self.active_directories = {}
         self.on_directory_peer_connected = None
+        self.on_directory_peer_disconnected = None
 
     def info_callback(self, msg: str) -> None:
         log.info(msg)
@@ -769,6 +770,20 @@ class OnionMessageChannel(MessageChannel):
         except Exception as e:
             log.warn("Directory peer connected hook failed for {}: {}".format(
                 peer.peer_location(), repr(e)))
+
+    def directory_peer_disconnected(self, peer) -> None:
+        if not self.on_directory_peer_disconnected:
+            return
+        reactor.callLater(0.0, self._fire_directory_peer_disconnected, peer)
+
+    def _fire_directory_peer_disconnected(self, peer) -> None:
+        if not self.on_directory_peer_disconnected:
+            return
+        try:
+            self.on_directory_peer_disconnected(peer)
+        except Exception as e:
+            log.warn("Directory peer disconnected hook failed for {}: {}"
+                     .format(peer.peer_location(), repr(e)))
 
     def onion_hostname_callback(self, hostname: str) -> None:
         """ This entrypoint marks the start of the OnionMessageChannel
@@ -1217,16 +1232,20 @@ class OnionMessageChannel(MessageChannel):
                           overwrite_connection=True)
         elif msgtype == LOCAL_CONTROL_MESSAGE_TYPES["disconnect"]:
             log.debug("We got a disconnect event: {}".format(msgval))
+            disconnected_peer = self.get_peer_by_id(msgval)
             if msgval in [x.peer_location() for x in self.get_connected_directory_peers()]:
                 # we need to use the full peer locator string, so that
                 # add_peer knows it can try to reconnect:
-                msgval = self.get_peer_by_id(msgval).peer_location()
+                msgval = disconnected_peer.peer_location()
             self.add_peer(msgval, connection=False,
                           overwrite_connection=True)
-            if self.self_as_peer.directory:
+            if not disconnected_peer:
+                disconnected_peer = self.get_peer_by_id(msgval)
+            if disconnected_peer and disconnected_peer.directory:
+                self.directory_peer_disconnected(disconnected_peer)
+            if self.self_as_peer.directory and disconnected_peer:
                 # We propagate the control message as a "peerlist" with
                 # the "D" flag:
-                disconnected_peer = self.get_peer_by_id(msgval)
                 for p in self.get_connected_nondirectory_peers():
                     self.send_peers(p, peer_filter=[disconnected_peer],
                                     disconnect=True)

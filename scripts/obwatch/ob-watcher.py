@@ -60,6 +60,10 @@ refresh_orderbook_form = '<form action="refreshorderbook" method="post"><input t
 sorted_units = ('BTC', 'mBTC', '&#956;BTC', 'satoshi')
 sorted_rel_units = ('%', '&#8241;', 'ppm')
 rel_unit_to_factor = {'%': 100, '&#8241;': 1e4, 'ppm': 1e6}
+orderbook_snapshot_columns = (
+    'counterparty', 'oid', 'ordertype', 'minsize', 'maxsize', 'txfee',
+    'cjfee')
+fidelity_bond_snapshot_columns = ('counterparty', 'takernick', 'proof')
 
 
 def calc_depth_data(db, value):
@@ -723,11 +727,8 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
         if self.path not in pages:
             return
         if self.path == '/refreshorderbook':
-            with self.taker.dblock:
-                self.taker.db.execute("DELETE FROM orderbook;")
-                self.taker.db.execute("DELETE FROM fidelitybonds;")
-            self.taker.msgchan.request_orderbook()
-            time.sleep(5)
+            self.taker.refresh_orderbook_preserving_snapshot(
+                'manual HTTP refresh')
             self.send_response(302)
             self.send_header('Location', self.get_url_base() + '/')
             self.end_headers()
@@ -788,6 +789,23 @@ class ObBasic(OrderbookWatch):
                         'JM_OBWATCH_RECONNECT_REFRESH_MIN_INTERVAL_SECONDS; '
                         'using 30 seconds.')
         self.last_reconnect_refresh_at = 0
+        self.manual_refresh_wait_seconds = 15
+        try:
+            self.manual_refresh_wait_seconds = int(os.environ.get(
+                'JM_OBWATCH_MANUAL_REFRESH_WAIT_SECONDS',
+                str(self.manual_refresh_wait_seconds)))
+        except ValueError:
+            log.warning('Invalid JM_OBWATCH_MANUAL_REFRESH_WAIT_SECONDS; '
+                        'using 15 seconds.')
+        self.refresh_run_lock = threading.Lock()
+        self.refresh_state_lock = threading.Lock()
+        self.refresh_tracking = False
+        self.refresh_expected_directory_peers = set()
+        self.refresh_disconnected_directory_peers = set()
+        self.refresh_seen_offers = set()
+        self.refresh_seen_counterparties = set()
+        self.refresh_seen_fidelity_counterparties = set()
+        self.pending_reconnect_refresh = False
         self.set_msgchan(msgchan)
         # in client-server, this is passed by client
         # in INIT message. Here, we have no Joinmarket client,
@@ -804,12 +822,217 @@ class ObBasic(OrderbookWatch):
         HTTPDThread(self, self.hostport).start()
         self.httpd_thread_started = True
 
+    def on_order_seen(self, counterparty, oid, ordertype, minsize, maxsize,
+                      txfee, cjfee):
+        with self.refresh_state_lock:
+            if self.refresh_tracking:
+                self.refresh_seen_offers.add((counterparty, str(oid)))
+                self.refresh_seen_counterparties.add(counterparty)
+        super().on_order_seen(counterparty, oid, ordertype, minsize, maxsize,
+                              txfee, cjfee)
+
+    def on_fidelity_bond_seen(self, nick, bond_type,
+                              fidelity_bond_proof_msg):
+        with self.refresh_state_lock:
+            if self.refresh_tracking:
+                self.refresh_seen_fidelity_counterparties.add(nick)
+        super().on_fidelity_bond_seen(nick, bond_type,
+                                      fidelity_bond_proof_msg)
+
+    def on_directory_peer_disconnected(self, peer):
+        try:
+            peer_location = peer.peer_location()
+        except Exception:
+            peer_location = 'unknown'
+        with self.refresh_state_lock:
+            if self.refresh_tracking and \
+                    peer_location in self.refresh_expected_directory_peers:
+                self.refresh_disconnected_directory_peers.add(peer_location)
+        log.info('Directory peer {} disconnected during orderbook '
+                 'tracking.'.format(peer_location))
+
+    def on_disconnect(self):
+        offers, fbonds = self.get_orderbook_counts()
+        self.pending_reconnect_refresh = True
+        log.warning('Message channel disconnected; preserving current '
+                    'orderbook snapshot ({} offers, {} fidelity bonds) '
+                    'until a directory reconnect refresh succeeds.'.format(
+                        offers, fbonds))
+
+    def get_orderbook_counts(self):
+        with self.dblock:
+            offers = self.db.execute(
+                'SELECT COUNT(*) AS count FROM orderbook;').fetchone()
+            fbonds = self.db.execute(
+                'SELECT COUNT(*) AS count FROM fidelitybonds;').fetchone()
+        return offers['count'], fbonds['count']
+
+    def snapshot_orderbook(self):
+        with self.dblock:
+            orderbook = [dict(row) for row in self.db.execute(
+                'SELECT * FROM orderbook;').fetchall()]
+            fidelitybonds = [dict(row) for row in self.db.execute(
+                'SELECT * FROM fidelitybonds;').fetchall()]
+        return {'orderbook': orderbook, 'fidelitybonds': fidelitybonds}
+
+    def restore_orderbook_snapshot(self, snapshot):
+        orderbook_rows = [
+            tuple(row[column] for column in orderbook_snapshot_columns)
+            for row in snapshot['orderbook']]
+        fidelity_bond_rows = [
+            tuple(row[column] for column in fidelity_bond_snapshot_columns)
+            for row in snapshot['fidelitybonds']]
+        with self.dblock:
+            self.db.execute('DELETE FROM orderbook;')
+            self.db.execute('DELETE FROM fidelitybonds;')
+            self.db.executemany(
+                'INSERT INTO orderbook VALUES(?, ?, ?, ?, ?, ?, ?);',
+                orderbook_rows)
+            self.db.executemany(
+                'INSERT INTO fidelitybonds VALUES(?, ?, ?);',
+                fidelity_bond_rows)
+
+    def get_connected_directory_locations(self):
+        channels = getattr(self.msgchan, 'mchannels', [self.msgchan])
+        connected_locations = set()
+        for mc in channels:
+            if hasattr(mc, 'get_connected_directory_peers'):
+                try:
+                    for peer in mc.get_connected_directory_peers():
+                        connected_locations.add(peer.peer_location())
+                except Exception as e:
+                    log.debug('Could not inspect connected directory peers: ' +
+                              repr(e))
+        return connected_locations
+
+    def begin_refresh_tracking(self, expected_directory_peers):
+        with self.refresh_state_lock:
+            self.refresh_tracking = True
+            self.refresh_expected_directory_peers = set(
+                expected_directory_peers)
+            self.refresh_disconnected_directory_peers = set()
+            self.refresh_seen_offers = set()
+            self.refresh_seen_counterparties = set()
+            self.refresh_seen_fidelity_counterparties = set()
+
+    def get_refresh_tracking_snapshot(self):
+        with self.refresh_state_lock:
+            return {
+                'offers': set(self.refresh_seen_offers),
+                'counterparties': set(self.refresh_seen_counterparties),
+                'fidelity_counterparties':
+                    set(self.refresh_seen_fidelity_counterparties),
+                'disconnected_directory_peers':
+                    set(self.refresh_disconnected_directory_peers),
+            }
+
+    def end_refresh_tracking(self):
+        with self.refresh_state_lock:
+            self.refresh_tracking = False
+            self.refresh_expected_directory_peers = set()
+            self.refresh_disconnected_directory_peers = set()
+            self.refresh_seen_offers = set()
+            self.refresh_seen_counterparties = set()
+            self.refresh_seen_fidelity_counterparties = set()
+
+    def prune_unseen_refresh_entries(self, tracking_snapshot):
+        seen_counterparties = (
+            tracking_snapshot['counterparties'] |
+            tracking_snapshot['fidelity_counterparties'])
+        if not seen_counterparties:
+            return
+        with self.dblock:
+            orderbook_counterparties = self.db.execute(
+                'SELECT DISTINCT counterparty FROM orderbook;').fetchall()
+            for row in orderbook_counterparties:
+                if row['counterparty'] not in seen_counterparties:
+                    self.db.execute(
+                        'DELETE FROM orderbook WHERE counterparty=?;',
+                        (row['counterparty'],))
+            fbond_counterparties = self.db.execute(
+                'SELECT DISTINCT counterparty FROM fidelitybonds;').fetchall()
+            for row in fbond_counterparties:
+                if row['counterparty'] not in seen_counterparties:
+                    self.db.execute(
+                        'DELETE FROM fidelitybonds WHERE counterparty=?;',
+                        (row['counterparty'],))
+
+    def refresh_orderbook_preserving_snapshot(self, reason):
+        if not self.refresh_run_lock.acquire(False):
+            log.info('Skipping {} orderbook refresh; another refresh is '
+                     'already in progress.'.format(reason))
+            self.request_orderbook()
+            return False
+        snapshot = self.snapshot_orderbook()
+        before_offers = len(snapshot['orderbook'])
+        before_fbonds = len(snapshot['fidelitybonds'])
+        try:
+            connected_directories = self.get_connected_directory_locations()
+            if not connected_directories:
+                self.pending_reconnect_refresh = True
+                log.warning('Preserving current orderbook snapshot for {}; '
+                            'no connected directory peers are available '
+                            '({} offers, {} fidelity bonds).'.format(
+                                reason, before_offers, before_fbonds))
+                self.request_orderbook()
+                return False
+
+            self.begin_refresh_tracking(connected_directories)
+            log.info('Starting {} orderbook refresh with {} connected '
+                     'directory peers and snapshot of {} offers, {} '
+                     'fidelity bonds.'.format(reason,
+                                              len(connected_directories),
+                                              before_offers, before_fbonds))
+            try:
+                self.request_orderbook()
+            except Exception:
+                self.restore_orderbook_snapshot(snapshot)
+                self.pending_reconnect_refresh = True
+                raise
+            time.sleep(max(0, self.manual_refresh_wait_seconds))
+            tracking_snapshot = self.get_refresh_tracking_snapshot()
+            seen_offers = len(tracking_snapshot['offers'])
+            disconnected_directories = \
+                tracking_snapshot['disconnected_directory_peers']
+            disconnected_directories |= (
+                set(connected_directories) -
+                self.get_connected_directory_locations())
+            if disconnected_directories:
+                self.restore_orderbook_snapshot(snapshot)
+                self.pending_reconnect_refresh = True
+                log.warning('Restored previous orderbook snapshot after {} '
+                            'refresh; directory peers disconnected before '
+                            'the refresh window completed: {}.'.format(
+                                reason,
+                                ','.join(sorted(disconnected_directories))))
+                return False
+
+            self.prune_unseen_refresh_entries(tracking_snapshot)
+            after_offers, after_fbonds = self.get_orderbook_counts()
+            self.pending_reconnect_refresh = False
+            log.info('Completed {} orderbook refresh: saw {} fresh offers; '
+                     'current snapshot has {} offers, {} fidelity bonds.'
+                     .format(reason, seen_offers, after_offers, after_fbonds))
+            return True
+        finally:
+            self.end_refresh_tracking()
+            self.refresh_run_lock.release()
+
+    def start_reconnect_orderbook_refresh(self, reason):
+        threading.Thread(target=self.refresh_orderbook_preserving_snapshot,
+                         args=(reason,),
+                         name='ReconnectOrderbookRefreshThread',
+                         daemon=True).start()
+
     def register_directory_connected_hook(self):
         channels = getattr(self.msgchan, 'mchannels', [self.msgchan])
         for mc in channels:
             if hasattr(mc, 'on_directory_peer_connected'):
                 mc.on_directory_peer_connected = \
                     self.on_directory_peer_connected
+            if hasattr(mc, 'on_directory_peer_disconnected'):
+                mc.on_directory_peer_disconnected = \
+                    self.on_directory_peer_disconnected
 
     def on_directory_peer_connected(self, peer):
         if self.reconnect_refresh_min_interval < 0:
@@ -828,7 +1051,8 @@ class ObBasic(OrderbookWatch):
         self.last_reconnect_refresh_at = now
         log.info('Directory peer {} connected; requesting orderbook '
                  'refresh.'.format(peer_location))
-        self.request_orderbook()
+        self.start_reconnect_orderbook_refresh(
+            'directory peer {} connected'.format(peer_location))
 
     def start_orderbook_refresh_once(self):
         if self.orderbook_refresh_thread_started:
