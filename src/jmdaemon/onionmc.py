@@ -950,6 +950,7 @@ class OnionMessageChannel(MessageChannel):
         # do not trigger on_welcome event until all directories
         # configured are ready:
         self.on_welcome_sent = False
+        self.directory_wait_failed = False
         self.directory_wait_counter = 0
         self.wait_for_directories_loop = task.LoopingCall(
             self.wait_for_directories)
@@ -1334,6 +1335,13 @@ class OnionMessageChannel(MessageChannel):
             peer.set_nick(nick)
             if getattr(self, "on_welcome_sent", False):
                 self.directory_peer_connected(peer)
+            elif getattr(self, "directory_wait_failed", False):
+                log.info("Directory peer {} handshaked after initial "
+                         "directory wait failure; starting onion messaging."
+                         .format(peer.peer_location()))
+                self.on_welcome(self)
+                self.on_welcome_sent = True
+                self.directory_wait_failed = False
         else:
             # it means, we are receiving an initial handshake
             # message from a 'client' (non-dn) peer.
@@ -1519,6 +1527,7 @@ class OnionMessageChannel(MessageChannel):
             # to continue.
             log.error("We failed to connect and handshake with "
                       "ANY directories; onion messaging is not functioning.")
+            self.directory_wait_failed = True
             self.wait_for_directories_loop.stop()
             # notice that in this failure mode, we do *not* shut down
             # the entire process, as this is only a failure to connect
