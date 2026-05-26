@@ -3,6 +3,7 @@ from jmdaemon.protocol import COMMAND_PREFIX, JM_VERSION
 from jmbase import get_log,  JM_APP_NAME, JMHiddenService, stop_reactor
 import json
 import copy
+import os
 import random
 import time
 from typing import Callable, Union, Tuple, List
@@ -25,6 +26,11 @@ ONION_VIRTUAL_PORT = 5222
 # How many seconds to wait before treating an onion
 # as unreachable
 CONNECT_TO_ONION_TIMEOUT = 60
+ONION_DIRECTORY_RECONNECT_INITIAL_DELAY = 4.0
+ONION_DIRECTORY_RECONNECT_MAX_DELAY = 120.0
+ONION_DIRECTORY_HEALTH_IDLE_SECONDS = 60.0
+ONION_DIRECTORY_HEALTH_PING_TIMEOUT_SECONDS = 30.0
+ONION_DIRECTORY_HEALTH_CHECK_INTERVAL_SECONDS = 15.0
 
 # Rate limiting for inbound non-directory messages per connection.
 # Directory nodes can legitimately send large orderbook bursts in response
@@ -34,6 +40,19 @@ CONNECT_TO_ONION_TIMEOUT = 60
 # protect against message flooding DoS attacks.
 ONION_MSG_RATE_LIMIT = 45
 ONION_MSG_RATE_INTERVAL = 15
+
+
+def get_float_env(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        log.warning("Invalid {}; using {}.".format(name, default))
+        return default
+    if value < minimum:
+        log.warning("Invalid {}; using {}.".format(name, default))
+        return default
+    return value
+
 
 def location_tuple_to_str(t: Tuple[str, int]) -> str:
     return f"{t[0]}:{t[1]}"
@@ -80,6 +99,7 @@ CONTROL_MESSAGE_TYPES = {"peerlist": 789, "getpeerlist": 791,
                          "handshake": 793, "dn-handshake": 795,
                          "ping": 797, "pong": 799, "disconnect": 801}
 JM_MESSAGE_TYPES = {"privmsg": 685, "pubmsg": 687}
+ONION_HEALTH_PING_FEATURE = "onion-health-ping"
 
 # Used for some control message construction, as detailed below.
 NICK_PEERLOCATOR_SEPARATOR = ";"
@@ -90,7 +110,7 @@ client_handshake_json = {"app-name": JM_APP_NAME,
  "directory": False,
  "location-string": "",
  "proto-ver": JM_VERSION,
- "features": {},
+ "features": {ONION_HEALTH_PING_FEATURE: True},
  "nick": "",
  "network": ""
 }
@@ -100,7 +120,7 @@ server_handshake_json = {"app-name": JM_APP_NAME,
   "directory": True,
   "proto-ver-min": JM_VERSION,
   "proto-ver-max": JM_VERSION,
-  "features": {},
+  "features": {ONION_HEALTH_PING_FEATURE: True},
   "accepted": False,
   "nick": "",
   "network": "",
@@ -373,6 +393,45 @@ class OnionPeer(object):
         # don't try to connect more than once
         # TODO: prefer state machine update
         self.connecting = False
+        now = time.monotonic()
+        self.last_rx_at = now
+        self.last_tx_at = now
+        self.last_activity_at = now
+        self.ping_sent_at = None
+        self.ping_nonce = None
+        self.awaiting_pong = False
+        self.health_check_closing = False
+        self.features = {}
+        self.health_ping_unsupported_logged = False
+
+    def mark_rx_activity(self) -> None:
+        now = time.monotonic()
+        self.last_rx_at = now
+        self.last_activity_at = now
+
+    def mark_tx_activity(self) -> None:
+        now = time.monotonic()
+        self.last_tx_at = now
+        self.last_activity_at = now
+
+    def mark_pong_received(self, nonce: str) -> None:
+        if self.awaiting_pong and nonce == self.ping_nonce:
+            log.info("Received health pong from {}.".format(
+                self.peer_location()))
+            self.awaiting_pong = False
+            self.ping_sent_at = None
+            self.ping_nonce = None
+            self.health_check_closing = False
+        elif self.awaiting_pong:
+            log.debug("Ignoring health pong from {} with unexpected nonce."
+                      .format(self.peer_location()))
+
+    def set_features(self, features: dict) -> None:
+        self.features = features if isinstance(features, dict) else {}
+        self.health_ping_unsupported_logged = False
+
+    def supports_health_ping(self) -> bool:
+        return bool(self.features.get(ONION_HEALTH_PING_FEATURE))
 
     def set_alternate_location(self, location_string: str) -> None:
         self.alternate_location = location_string
@@ -404,6 +463,14 @@ class OnionPeer(object):
         assert destn_status in allowed_updates, ("couldn't update state "
                         "from {} to {}".format(self._status, destn_status))
         self._status = destn_status
+        if destn_status == PEER_STATUS_HANDSHAKED:
+            self.mark_rx_activity()
+            self.awaiting_pong = False
+            self.ping_sent_at = None
+            self.ping_nonce = None
+            self.health_check_closing = False
+            if self.directory and hasattr(self, "reset_reconnect_delay"):
+                self.reset_reconnect_delay()
         # the handshakes are always initiated by a client:
         if destn_status == PEER_STATUS_CONNECTED:
             self.connecting = False
@@ -490,11 +557,16 @@ class OnionPeer(object):
         if not self.factory:
             # we try to send via the overall message channel serving
             # protocol, i.e. we assume the connection was made inbound:
-            return self.messagechannel.proto_factory.send(message,
+            sent = self.messagechannel.proto_factory.send(message,
                         self.alternate_location)
-        return self.factory.send(message)
+        else:
+            sent = self.factory.send(message)
+        if sent:
+            self.mark_tx_activity()
+        return sent
 
     def receive_message(self, message: OnionCustomMessage) -> None:
+        self.mark_rx_activity()
         self.messagechannel.receive_msg(message, self.peer_location())
 
     def notify_message_unsendable(self):
@@ -512,9 +584,9 @@ class OnionPeer(object):
         """
         if self.connecting:
             return
-        self.connecting = True
         if self._status in [PEER_STATUS_HANDSHAKED, PEER_STATUS_CONNECTED]:
             return
+        self.connecting = True
         if not (self.hostname and self.port > 0):
             raise OnionPeerConnectionError(
                 "Cannot connect without host, port info")
@@ -563,7 +635,12 @@ class OnionPeer(object):
 
     def register_disconnection(self) -> None:
         # for non-directory peers, just stop
-        self.reconnecting_service.stopService()
+        self.awaiting_pong = False
+        self.ping_sent_at = None
+        self.ping_nonce = None
+        self.health_check_closing = False
+        if self.reconnecting_service:
+            self.reconnecting_service.stopService()
         self.messagechannel.register_disconnection(self.peer_location())
 
     def try_to_connect(self) -> None:
@@ -606,21 +683,50 @@ class OnionPeerPassive(OnionPeer):
         pass
 
 class OnionDirectoryPeer(OnionPeer):
-    delay = 4.0
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.initial_reconnect_delay = getattr(
+            self.messagechannel, "directory_reconnect_initial_delay",
+            ONION_DIRECTORY_RECONNECT_INITIAL_DELAY)
+        self.max_reconnect_delay = getattr(
+            self.messagechannel, "directory_reconnect_max_delay",
+            ONION_DIRECTORY_RECONNECT_MAX_DELAY)
+        if self.max_reconnect_delay < self.initial_reconnect_delay:
+            self.max_reconnect_delay = self.initial_reconnect_delay
+        self.delay = self.initial_reconnect_delay
+        self.reconnect_call = None
+
+    def reset_reconnect_delay(self) -> None:
+        if self.delay != self.initial_reconnect_delay:
+            log.info("Reset reconnect delay for directory {} to {} seconds."
+                     .format(self.peer_location(),
+                             self.initial_reconnect_delay))
+        self.delay = self.initial_reconnect_delay
+        if self.reconnect_call and self.reconnect_call.active():
+            self.reconnect_call.cancel()
+        self.reconnect_call = None
 
     def try_to_connect(self) -> None:
+        if self.reconnect_call and self.reconnect_call.active():
+            log.debug("Reconnect to {} already scheduled.".format(
+                self.peer_location()))
+            return
         # Delay deliberately expands out to very
         # long times as yg-s tend to be very long
         # running bots:
-        # We will only expand delay 20 times max
-        # (4 * 1.5^19 = 8867.3)
-        if self.delay < 8868:
-            self.delay *= 1.5
+        self.delay = min(self.delay * 1.5, self.max_reconnect_delay)
         # randomize by a few seconds to minimize bursty-ness locally
         jitter = random.randint(-1, 5)
+        reconnect_delay = min(max(0, self.delay + jitter),
+                              self.max_reconnect_delay)
         log.info(f"Going to reattempt connection to {self.peer_location()} in "
-                 f"{self.delay + jitter} seconds.")
-        reactor.callLater(self.delay + jitter, self.connect)
+                 f"{reconnect_delay} seconds.")
+        self.reconnect_call = reactor.callLater(
+            reconnect_delay, self._reattempt_connection)
+
+    def _reattempt_connection(self) -> None:
+        self.reconnect_call = None
+        self.connect()
 
     def register_connection(self) -> None:
         self.messagechannel.update_directory_map(self, connected=True)
@@ -637,6 +743,56 @@ class OnionDirectoryPeer(OnionPeer):
         super().respond_to_connection_failure(failure)
         # same logic as for register_disconnection
         self.try_to_connect()
+
+    def send_health_ping(self, now: float) -> None:
+        self.ping_nonce = "{}:{}".format(now, random.randint(0, 2**32))
+        self.ping_sent_at = now
+        self.awaiting_pong = True
+        log.info("Sending health ping to directory {} after {:.1f} seconds "
+                 "idle.".format(self.peer_location(),
+                                now - self.last_activity_at))
+        sent = self.send(OnionCustomMessage(
+            self.ping_nonce, CONTROL_MESSAGE_TYPES["ping"]))
+        if not sent:
+            self.awaiting_pong = False
+            self.close_for_health_timeout("health ping send failed")
+
+    def check_health(self, now: float, idle_seconds: float,
+                     ping_timeout_seconds: float) -> None:
+        if self.status() != PEER_STATUS_HANDSHAKED:
+            return
+        if not self.supports_health_ping():
+            if not self.health_ping_unsupported_logged:
+                log.info("Directory {} does not advertise {}; active health "
+                         "ping disabled for this peer.".format(
+                             self.peer_location(), ONION_HEALTH_PING_FEATURE))
+                self.health_ping_unsupported_logged = True
+            return
+        if self.awaiting_pong:
+            if self.ping_sent_at is not None and \
+                    now - self.ping_sent_at >= ping_timeout_seconds:
+                self.close_for_health_timeout(
+                    "health pong timeout after {:.1f} seconds".format(
+                        now - self.ping_sent_at))
+            return
+        if now - self.last_activity_at >= idle_seconds:
+            self.send_health_ping(now)
+
+    def close_for_health_timeout(self, reason: str) -> None:
+        if self.health_check_closing:
+            return
+        self.health_check_closing = True
+        log.warning("Closing stale directory connection to {}: {}."
+                    .format(self.peer_location(), reason))
+        proto = self.factory.proto_client if self.factory else None
+        if proto and getattr(proto, "transport", None):
+            proto.transport.loseConnection()
+            return
+        try:
+            self.disconnect()
+        except Exception as e:
+            log.warning("Failed to close stale directory connection to {}: {}"
+                        .format(self.peer_location(), repr(e)))
 
 class OnionMessageChannel(MessageChannel):
     """ Sends messages to other nodes of the same type over Tor
@@ -682,6 +838,22 @@ class OnionMessageChannel(MessageChannel):
         # the client, to decide whether to set up our connections
         # over localhost (if testing), without Tor:
         set_testing_mode(configdata)
+        self.directory_reconnect_initial_delay = \
+            ONION_DIRECTORY_RECONNECT_INITIAL_DELAY
+        self.directory_reconnect_max_delay = get_float_env(
+            "JM_ONION_RECONNECT_MAX_DELAY_SECONDS",
+            ONION_DIRECTORY_RECONNECT_MAX_DELAY,
+            minimum=self.directory_reconnect_initial_delay)
+        self.directory_health_idle_seconds = get_float_env(
+            "JM_ONION_HEALTH_IDLE_SECONDS",
+            ONION_DIRECTORY_HEALTH_IDLE_SECONDS)
+        self.directory_health_ping_timeout_seconds = get_float_env(
+            "JM_ONION_HEALTH_PING_TIMEOUT_SECONDS",
+            ONION_DIRECTORY_HEALTH_PING_TIMEOUT_SECONDS)
+        self.directory_health_check_interval_seconds = get_float_env(
+            "JM_ONION_HEALTH_CHECK_INTERVAL_SECONDS",
+            ONION_DIRECTORY_HEALTH_CHECK_INTERVAL_SECONDS)
+        self.directory_health_loop = None
         # keep track of peers. the list will be instances
         # of OnionPeer:
         self.peers = set()
@@ -796,14 +968,42 @@ class OnionMessageChannel(MessageChannel):
 
 # ABC implementation section
     def run(self) -> None:
+        self.start_directory_health_loop()
         self.hs_up_loop = task.LoopingCall(self.check_onion_hostname)
         self.hs_up_loop.start(0.5)
 
     def shutdown(self) -> None:
         self.give_up = True
+        if self.directory_health_loop and self.directory_health_loop.running:
+            self.directory_health_loop.stop()
         for p in self.peers:
             if p.reconnecting_service:
                 p.reconnecting_service.stopService()
+
+    def start_directory_health_loop(self) -> None:
+        if self.directory_health_loop:
+            return
+        if self.directory_health_check_interval_seconds <= 0 or \
+                self.directory_health_idle_seconds <= 0 or \
+                self.directory_health_ping_timeout_seconds <= 0:
+            log.info("Directory peer health check disabled.")
+            return
+        self.directory_health_loop = task.LoopingCall(
+            self.check_directory_health)
+        self.directory_health_loop.start(
+            self.directory_health_check_interval_seconds, now=False)
+        log.info("Directory peer health check every {} seconds; idle "
+                 "threshold {} seconds, ping timeout {} seconds.".format(
+                     self.directory_health_check_interval_seconds,
+                     self.directory_health_idle_seconds,
+                     self.directory_health_ping_timeout_seconds))
+
+    def check_directory_health(self) -> None:
+        now = time.monotonic()
+        for peer in self.get_connected_directory_peers():
+            if isinstance(peer, OnionDirectoryPeer):
+                peer.check_health(now, self.directory_health_idle_seconds,
+                                  self.directory_health_ping_timeout_seconds)
 
     def get_pubmsg(self, msg:str, source_nick:str ="") -> str:
         """ Converts a message into the known format for
@@ -813,7 +1013,7 @@ class OnionMessageChannel(MessageChannel):
         """
         nick = source_nick if source_nick else self.nick
         return nick + COMMAND_PREFIX + "PUBLIC" + msg
- 
+
     def get_privmsg(self, nick: str, cmd: str, message: str,
                     source_nick=None) -> str:
         """ See `get_pubmsg` for comment on `source_nick`.
@@ -1018,9 +1218,12 @@ class OnionMessageChannel(MessageChannel):
         if not peer:
             log.warn("Received message but could not find peer: {}".format(peer_location))
             return
+        if peer_location != "00":
+            peer.mark_rx_activity()
         msgtype = message.msgtype
         msgval = message.text
-        if msgtype in LOCAL_CONTROL_MESSAGE_TYPES.values():
+        if peer_location == "00" and \
+                msgtype in LOCAL_CONTROL_MESSAGE_TYPES.values():
             self.process_control_message(peer_location, msgtype, msgval)
             # local control messages are processed first.
             # TODO this is a historical artifact, we can simplify.
@@ -1225,6 +1428,19 @@ class OnionMessageChannel(MessageChannel):
         elif msgtype == CONTROL_MESSAGE_TYPES["dn-handshake"]:
             self.process_handshake(peerid, msgval, dn=True)
             return True
+        elif msgtype == CONTROL_MESSAGE_TYPES["ping"] and peerid != "00":
+            peer = self.get_peer_by_id(peerid)
+            if peer:
+                log.debug("Received health ping from {}.".format(
+                    peer.peer_location()))
+                self._send(peer, OnionCustomMessage(
+                    msgval, CONTROL_MESSAGE_TYPES["pong"]))
+            return True
+        elif msgtype == CONTROL_MESSAGE_TYPES["pong"] and peerid != "00":
+            peer = self.get_peer_by_id(peerid)
+            if peer:
+                peer.mark_pong_received(msgval)
+            return True
         elif msgtype == LOCAL_CONTROL_MESSAGE_TYPES["connect"]:
             self.add_peer(msgval, connection=True,
                           overwrite_connection=True)
@@ -1331,6 +1547,7 @@ class OnionMessageChannel(MessageChannel):
                          "network: {}".format(net))
                 return
             # We received a valid, accepting dn-handshake. Update the peer.
+            peer.set_features(features)
             peer.update_status(PEER_STATUS_HANDSHAKED)
             peer.set_nick(nick)
             if getattr(self, "on_welcome_sent", False):
@@ -1386,6 +1603,7 @@ class OnionMessageChannel(MessageChannel):
             if peerid != full_location_string:
                 peer.set_alternate_location(peerid)
             peer.set_nick(nick)
+            peer.set_features(features)
             # client peer's handshake message was valid; send ours, and
             # then mark this peer as successfully handshaked:
             our_hs = copy.deepcopy(server_handshake_json)
