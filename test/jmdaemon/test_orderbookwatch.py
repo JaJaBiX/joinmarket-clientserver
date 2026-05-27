@@ -128,6 +128,31 @@ def test_order_sources_are_pruned_per_directory():
         'SELECT * FROM orderbook_sources;').fetchall()
     assert len(source_rows) == 0
 
+def test_directory_message_metadata_tracks_relayed_orderbook_requests():
+    ob = get_ob()
+    directory = "dn1.onion:5222"
+
+    ob.msgchan.on_pubmsg("J5Requester", "!orderbook",
+                         source_directory=directory)
+    row = ob.db.execute(
+        'SELECT * FROM directory_peers WHERE directory=?;',
+        (directory,)).fetchone()
+    assert row["last_message_at"] is not None
+    assert row["last_pubmsg_at"] is not None
+    assert row["last_orderbook_request_seen_at"] is not None
+    assert row["last_orderbook_request_at"] is None
+    assert row["last_orderbook_response_at"] is None
+    assert row["rx_message_count"] == 1
+
+    ob.msgchan.on_pubmsg("J5Requester", "!hp2 deadbeef",
+                         source_directory=directory)
+    ob.msgchan.on_privmsg("J5Maker", "not a command",
+                          source_directory=directory)
+    row = ob.db.execute(
+        'SELECT * FROM directory_peers WHERE directory=?;',
+        (directory,)).fetchone()
+    assert row["rx_message_count"] == 3
+
 def test_disconnect_leave():
     ob = get_ob()
     t_orderbook = [{u'counterparty': u'J5FA1Gj7Ln4vSGne', u'ordertype': u'reloffer', u'oid': 0,

@@ -8,7 +8,7 @@ import time
 from decimal import InvalidOperation, Decimal
 from numbers import Integral
 
-from jmdaemon.protocol import JM_VERSION
+from jmdaemon.protocol import COMMAND_PREFIX, JM_VERSION
 from jmdaemon import fidelity_bond_sanity_check
 from jmbase.support import dict_factory, get_log, joinmarket_alert
 log = get_log()
@@ -26,7 +26,7 @@ class OrderbookWatch(object):
                                self.on_order_cancel, self.on_fidelity_bond_seen)
         self.msgchan.register_channel_callbacks(
             self.on_welcome, self.on_set_topic, None, self.on_disconnect,
-            self.on_nick_leave, None)
+            self.on_nick_leave, None, None, self.on_message_seen)
 
         self.dblock = threading.Lock()
         con = sqlite3.connect(":memory:", check_same_thread=False)
@@ -58,10 +58,14 @@ class OrderbookWatch(object):
                             "last_connected_at INTEGER, "
                             "last_disconnected_at INTEGER, "
                             "last_seen_at INTEGER, "
+                            "last_message_at INTEGER, "
+                            "last_pubmsg_at INTEGER, "
+                            "last_orderbook_request_seen_at INTEGER, "
                             "last_orderbook_request_at INTEGER, "
                             "last_orderbook_response_at INTEGER, "
                             "last_successful_refresh_at INTEGER, "
-                            "last_refresh_id TEXT, status TEXT);")
+                            "last_refresh_id TEXT, rx_message_count INTEGER, "
+                            "status TEXT);")
         finally:
             self.dblock.release()
 
@@ -88,8 +92,8 @@ class OrderbookWatch(object):
         if self.db.fetchone():
             return
         self.db.execute(
-            ("INSERT INTO directory_peers VALUES"
-             "(?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"),
+            ("INSERT INTO directory_peers(directory, rx_message_count) "
+             "VALUES(?, 0);"),
             (directory,))
 
     def _set_directory_peer_fields_locked(self, directory, **fields):
@@ -135,6 +139,37 @@ class OrderbookWatch(object):
             if refresh_id is not None:
                 fields["last_refresh_id"] = refresh_id
             self._set_directory_peer_fields_locked(directory, **fields)
+        finally:
+            self.dblock.release()
+
+    @staticmethod
+    def _pubmsg_has_orderbook_request(message):
+        if not message or message[0] != COMMAND_PREFIX:
+            return False
+        commands = message[1:].split(COMMAND_PREFIX)
+        return any(command.split(" ")[0] == "orderbook"
+                   for command in commands)
+
+    def on_message_seen(self, mc, msgtype, nick, message, source_directory=None):
+        if not source_directory:
+            return
+        self.record_directory_message(source_directory, msgtype, message)
+
+    def record_directory_message(self, directory, msgtype, message):
+        now = self._now()
+        is_pubmsg = msgtype == "pubmsg"
+        try:
+            self.dblock.acquire(True)
+            fields = {"last_message_at": now, "status": "connected"}
+            if is_pubmsg:
+                fields["last_pubmsg_at"] = now
+                if self._pubmsg_has_orderbook_request(message):
+                    fields["last_orderbook_request_seen_at"] = now
+            self._set_directory_peer_fields_locked(directory, **fields)
+            self.db.execute(
+                ("UPDATE directory_peers SET "
+                 "rx_message_count=COALESCE(rx_message_count, 0) + 1 "
+                 "WHERE directory=?;"), (directory,))
         finally:
             self.dblock.release()
 

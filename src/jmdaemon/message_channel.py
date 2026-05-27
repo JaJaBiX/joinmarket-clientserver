@@ -22,6 +22,14 @@ def _call_orderbook_callback(callback, *args, source_directory=None):
     return callback(*args, source_directory)
 
 
+def _call_message_callback(callback, *args, source_directory=None):
+    if not callback:
+        return None
+    if source_directory is None:
+        return callback(*args)
+    return callback(*args, source_directory)
+
+
 class CJPeerError(Exception):
     pass
 
@@ -119,6 +127,7 @@ class MessageChannelCollection(object):
         self.mc_lock = threading.Lock()
         self.nick=None
         self.on_welcome_announce_id = None
+        self.on_message_trigger = None
 
     def set_nick(self, nick):
         if nick != self.nick:
@@ -173,6 +182,10 @@ class MessageChannelCollection(object):
     def see_nick(self, nick, mc):
         with self.mc_lock:
             self.nicks_seen[mc].add(nick)
+
+    def on_message(self, mc, msgtype, nick, message, source_directory=None):
+        _call_message_callback(self.on_message_trigger, mc, msgtype, nick,
+                               message, source_directory=source_directory)
 
     def unsee_nick(self, nick, mc):
         with self.mc_lock:
@@ -530,7 +543,9 @@ class MessageChannelCollection(object):
                                    on_connect=None,
                                    on_disconnect=None,
                                    on_nick_leave=None,
-                                   on_nick_change=None):
+                                   on_nick_change=None,
+                                   on_pubmsg_trigger=None,
+                                   on_message_trigger=None):
         """Special cases:
         on_welcome: we maintain it
         in this class, since we only want to trigger arrival
@@ -554,11 +569,12 @@ class MessageChannelCollection(object):
         self.on_nick_leave = on_nick_leave
         self.on_connect = on_connect
         self.on_nick_change = on_nick_change
+        self.on_message_trigger = on_message_trigger
         for mc in self.mchannels:
             mc.register_channel_callbacks(
                 self.on_welcome_trigger, on_set_topic, self.on_connect_trigger,
                 self.on_disconnect_trigger, self.on_nick_leave_trigger,
-                self.on_nick_change_trigger, self.see_nick)
+                self.on_nick_change_trigger, self.see_nick, self.on_message)
 
     def on_nick_change_trigger(self, new_nick):
         """If any underlying messagechannel object fails to register
@@ -696,6 +712,7 @@ class MessageChannel(object):
         self.on_nick_change = None
         self.on_pubmsg_trigger = None
         self.on_privmsg_trigger = None
+        self.on_message_trigger = None
         # orderbook watch functions
         self.on_order_seen = None
         self.on_order_cancel = None
@@ -771,7 +788,8 @@ class MessageChannel(object):
                                    on_disconnect=None,
                                    on_nick_leave=None,
                                    on_nick_change=None,
-                                   on_pubmsg_trigger=None):
+                                   on_pubmsg_trigger=None,
+                                   on_message_trigger=None):
         self.on_welcome = on_welcome
         self.on_set_topic = on_set_topic
         self.on_connect = on_connect
@@ -780,6 +798,7 @@ class MessageChannel(object):
         self.on_nick_change = on_nick_change
         #Fire to MCcollection to mark nicks as "seen"
         self.on_pubmsg_trigger = on_pubmsg_trigger
+        self.on_message_trigger = on_message_trigger
 
     # orderbook watcher commands
     def register_orderbookwatch_callbacks(self,
@@ -933,6 +952,8 @@ class MessageChannel(object):
         self._privmsg(nick, cmd, message)
 
     def on_pubmsg(self, nick, message, source_directory=None):
+        _call_message_callback(self.on_message_trigger, self, "pubmsg", nick,
+                               message, source_directory=source_directory)
         #Even illegal messages mark a nick as "seen"
         if self.on_pubmsg_trigger:
             self.on_pubmsg_trigger(nick, self)
@@ -968,6 +989,8 @@ class MessageChannel(object):
 
     def on_privmsg(self, nick, message, source_directory=None):
         """handles the case when a private message is received"""
+        _call_message_callback(self.on_message_trigger, self, "privmsg", nick,
+                               message, source_directory=source_directory)
         #Aberrant short messages should be handled by subclasses
         #in _privmsg, but this constitutes a sanity check. Note that
         #messages which use an encrypted_command but present no
