@@ -1039,6 +1039,19 @@ class OnionMessageChannel(MessageChannel):
             else:
                 self._send(dp, msg)
 
+    def pubmsg_to_directory(self, directory_location: str, msg: str) -> bool:
+        dp = self.get_peer_by_id(directory_location)
+        if not dp or not dp.directory:
+            log.debug("Could not find directory peer for targeted pubmsg: {}"
+                      .format(directory_location))
+            return False
+        encoded_msg = OnionCustomMessage(self.get_pubmsg(msg),
+                                JM_MESSAGE_TYPES["pubmsg"])
+        if dp == self.self_as_peer:
+            self.receive_msg(encoded_msg, "00")
+            return True
+        return self._send(dp, encoded_msg)
+
     def should_try_to_connect(self, peer: OnionPeer) -> bool:
         if not peer:
             return False
@@ -1250,8 +1263,10 @@ class OnionMessageChannel(MessageChannel):
             nicks_msgs = msgval.split(COMMAND_PREFIX)
             from_nick, to_nick = nicks_msgs[:2]
             msg = COMMAND_PREFIX + COMMAND_PREFIX.join(nicks_msgs[2:])
+            source_directory = peer.peer_location() if peer.directory else None
             if to_nick == "PUBLIC":
-                self.on_pubmsg(from_nick, msg)
+                self.on_pubmsg(from_nick, msg,
+                               source_directory=source_directory)
                 if self.self_as_peer.directory:
                     self.forward_pubmsg_to_peers(msg, from_nick)
             elif to_nick != self.nick:
@@ -1260,7 +1275,8 @@ class OnionMessageChannel(MessageChannel):
                 else:
                     self.forward_privmsg_to_peer(to_nick, msg, from_nick)
             else:
-                self.on_privmsg(from_nick, msg)
+                self.on_privmsg(from_nick, msg,
+                                source_directory=source_directory)
         except Exception as e:
             log.debug("Invalid Joinmarket message: {}, error was: {}".format(
                 msgval, repr(e)))
@@ -1364,6 +1380,7 @@ class OnionMessageChannel(MessageChannel):
         log.debug("Directory {} has lost connection to: {}".format(
             dir_peer.peer_location(), nick))
         self.active_directories[nick][dir_peer] = False
+        self.on_nick_leave(nick, self, dir_peer.peer_location())
         if not any(self.active_directories[nick].values()):
             self.on_nick_leave(nick, self)
 

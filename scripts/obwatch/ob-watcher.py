@@ -11,6 +11,7 @@ import os
 import threading
 import time
 import sys
+import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
 from optparse import OptionParser
@@ -258,6 +259,18 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
             offers.append(o)
 
         return {"offers": offers, "fidelitybonds": fidelitybonds}
+
+    def create_orderbook_sources_obj(self):
+        return {
+            "directory_peers": [dict(row)
+                                for row in self.taker.get_directory_peer_rows()],
+            "orderbook_sources": [dict(row)
+                                  for row in
+                                  self.taker.get_orderbook_source_rows()],
+            "fidelitybond_sources": [
+                dict(row)
+                for row in self.taker.get_fidelitybond_source_rows()],
+        }
 
     def create_depth_chart(self, cj_amount, args=None):
         if 'matplotlib' not in sys.modules:
@@ -611,8 +624,8 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
         self.path, query = self.path.split('?', 1) if '?' in self.path else (
             self.path, '')
         args = parse_qs(query)
-        pages = ['/', '/fidelitybonds', '/ordersize', '/depth', '/sybilresistance',
-            '/orderbook.json']
+        pages = ['/', '/fidelitybonds', '/ordersize', '/depth',
+            '/sybilresistance', '/orderbook.json', '/orderbook-sources.json']
         static_files = {'/vendor/sorttable.js', '/vendor/bootstrap.min.css', '/vendor/jquery-3.5.1.slim.min.js'}
         if self.path in static_files or self.path not in pages:
             return super().do_GET()
@@ -694,6 +707,9 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
         elif self.path == '/orderbook.json':
             replacements = {}
             orderbook_fmt = json.dumps(self.create_orderbook_obj())
+        elif self.path == '/orderbook-sources.json':
+            replacements = {}
+            orderbook_fmt = json.dumps(self.create_orderbook_sources_obj())
         orderbook_page = orderbook_fmt
         for key, rep in replacements.items():
             orderbook_page = orderbook_page.replace(key, rep)
@@ -797,11 +813,30 @@ class ObBasic(OrderbookWatch):
         except ValueError:
             log.warning('Invalid JM_OBWATCH_MANUAL_REFRESH_WAIT_SECONDS; '
                         'using 15 seconds.')
+        self.directory_source_stale_seconds = 900
+        try:
+            self.directory_source_stale_seconds = int(os.environ.get(
+                'JM_OBWATCH_DN_SOURCE_STALE_SECONDS',
+                str(self.directory_source_stale_seconds)))
+        except ValueError:
+            log.warning('Invalid JM_OBWATCH_DN_SOURCE_STALE_SECONDS; '
+                        'using 900 seconds.')
+        self.directory_refresh_response_timeout_seconds = 30
+        try:
+            self.directory_refresh_response_timeout_seconds = int(
+                os.environ.get(
+                    'JM_OBWATCH_DN_REFRESH_RESPONSE_TIMEOUT_SECONDS',
+                    str(self.directory_refresh_response_timeout_seconds)))
+        except ValueError:
+            log.warning('Invalid '
+                        'JM_OBWATCH_DN_REFRESH_RESPONSE_TIMEOUT_SECONDS; '
+                        'using 30 seconds.')
         self.refresh_run_lock = threading.Lock()
         self.refresh_state_lock = threading.Lock()
         self.refresh_tracking = False
         self.refresh_expected_directory_peers = set()
         self.refresh_disconnected_directory_peers = set()
+        self.refresh_seen_directory_peers = set()
         self.refresh_seen_offers = set()
         self.refresh_seen_counterparties = set()
         self.refresh_seen_fidelity_counterparties = set()
@@ -823,27 +858,34 @@ class ObBasic(OrderbookWatch):
         self.httpd_thread_started = True
 
     def on_order_seen(self, counterparty, oid, ordertype, minsize, maxsize,
-                      txfee, cjfee):
+                      txfee, cjfee, source_directory=None):
         with self.refresh_state_lock:
             if self.refresh_tracking:
                 self.refresh_seen_offers.add((counterparty, str(oid)))
                 self.refresh_seen_counterparties.add(counterparty)
+                if source_directory:
+                    self.refresh_seen_directory_peers.add(source_directory)
         super().on_order_seen(counterparty, oid, ordertype, minsize, maxsize,
-                              txfee, cjfee)
+                              txfee, cjfee, source_directory)
 
     def on_fidelity_bond_seen(self, nick, bond_type,
-                              fidelity_bond_proof_msg):
+                              fidelity_bond_proof_msg, source_directory=None):
         with self.refresh_state_lock:
             if self.refresh_tracking:
                 self.refresh_seen_fidelity_counterparties.add(nick)
+                if source_directory:
+                    self.refresh_seen_directory_peers.add(source_directory)
         super().on_fidelity_bond_seen(nick, bond_type,
-                                      fidelity_bond_proof_msg)
+                                      fidelity_bond_proof_msg,
+                                      source_directory)
 
     def on_directory_peer_disconnected(self, peer):
         try:
             peer_location = peer.peer_location()
         except Exception:
             peer_location = 'unknown'
+        if peer_location != 'unknown':
+            self.record_directory_disconnected(peer_location)
         with self.refresh_state_lock:
             if self.refresh_tracking and \
                     peer_location in self.refresh_expected_directory_peers:
@@ -873,24 +915,41 @@ class ObBasic(OrderbookWatch):
                 'SELECT * FROM orderbook;').fetchall()]
             fidelitybonds = [dict(row) for row in self.db.execute(
                 'SELECT * FROM fidelitybonds;').fetchall()]
-        return {'orderbook': orderbook, 'fidelitybonds': fidelitybonds}
+            orderbook_sources = [dict(row) for row in self.db.execute(
+                'SELECT * FROM orderbook_sources;').fetchall()]
+            fidelitybond_sources = [dict(row) for row in self.db.execute(
+                'SELECT * FROM fidelitybond_sources;').fetchall()]
+            directory_peers = [dict(row) for row in self.db.execute(
+                'SELECT * FROM directory_peers;').fetchall()]
+        return {'orderbook': orderbook, 'fidelitybonds': fidelitybonds,
+                'orderbook_sources': orderbook_sources,
+                'fidelitybond_sources': fidelitybond_sources,
+                'directory_peers': directory_peers}
 
     def restore_orderbook_snapshot(self, snapshot):
-        orderbook_rows = [
-            tuple(row[column] for column in orderbook_snapshot_columns)
-            for row in snapshot['orderbook']]
-        fidelity_bond_rows = [
-            tuple(row[column] for column in fidelity_bond_snapshot_columns)
-            for row in snapshot['fidelitybonds']]
+        def insert_rows(table, rows):
+            if not rows:
+                return
+            columns = list(rows[0].keys())
+            placeholders = ', '.join(['?'] * len(columns))
+            column_sql = ', '.join(columns)
+            self.db.executemany(
+                'INSERT INTO {} ({}) VALUES({});'.format(
+                    table, column_sql, placeholders),
+                [tuple(row[column] for column in columns) for row in rows])
+
         with self.dblock:
             self.db.execute('DELETE FROM orderbook;')
             self.db.execute('DELETE FROM fidelitybonds;')
-            self.db.executemany(
-                'INSERT INTO orderbook VALUES(?, ?, ?, ?, ?, ?, ?);',
-                orderbook_rows)
-            self.db.executemany(
-                'INSERT INTO fidelitybonds VALUES(?, ?, ?);',
-                fidelity_bond_rows)
+            self.db.execute('DELETE FROM orderbook_sources;')
+            self.db.execute('DELETE FROM fidelitybond_sources;')
+            self.db.execute('DELETE FROM directory_peers;')
+            insert_rows('orderbook', snapshot['orderbook'])
+            insert_rows('fidelitybonds', snapshot['fidelitybonds'])
+            insert_rows('orderbook_sources', snapshot['orderbook_sources'])
+            insert_rows('fidelitybond_sources',
+                        snapshot['fidelitybond_sources'])
+            insert_rows('directory_peers', snapshot['directory_peers'])
 
     def get_connected_directory_locations(self):
         channels = getattr(self.msgchan, 'mchannels', [self.msgchan])
@@ -911,6 +970,7 @@ class ObBasic(OrderbookWatch):
             self.refresh_expected_directory_peers = set(
                 expected_directory_peers)
             self.refresh_disconnected_directory_peers = set()
+            self.refresh_seen_directory_peers = set()
             self.refresh_seen_offers = set()
             self.refresh_seen_counterparties = set()
             self.refresh_seen_fidelity_counterparties = set()
@@ -922,6 +982,7 @@ class ObBasic(OrderbookWatch):
                 'counterparties': set(self.refresh_seen_counterparties),
                 'fidelity_counterparties':
                     set(self.refresh_seen_fidelity_counterparties),
+                'directory_peers': set(self.refresh_seen_directory_peers),
                 'disconnected_directory_peers':
                     set(self.refresh_disconnected_directory_peers),
             }
@@ -931,6 +992,7 @@ class ObBasic(OrderbookWatch):
             self.refresh_tracking = False
             self.refresh_expected_directory_peers = set()
             self.refresh_disconnected_directory_peers = set()
+            self.refresh_seen_directory_peers = set()
             self.refresh_seen_offers = set()
             self.refresh_seen_counterparties = set()
             self.refresh_seen_fidelity_counterparties = set()
@@ -957,15 +1019,126 @@ class ObBasic(OrderbookWatch):
                         'DELETE FROM fidelitybonds WHERE counterparty=?;',
                         (row['counterparty'],))
 
-    def refresh_orderbook_preserving_snapshot(self, reason):
+    def make_refresh_id(self, reason):
+        normalized_reason = reason.replace(' ', '-')
+        return '{}-{}'.format(normalized_reason[:40], uuid.uuid4().hex)
+
+    def get_directory_refresh_metadata(self):
+        with self.dblock:
+            rows = self.db.execute('SELECT * FROM directory_peers;').fetchall()
+        return {row['directory']: dict(row) for row in rows}
+
+    def get_stale_directory_locations(self, candidate_directories=None):
+        connected_directories = self.get_connected_directory_locations()
+        if candidate_directories is not None:
+            connected_directories &= set(candidate_directories)
+        if self.directory_source_stale_seconds <= 0:
+            return connected_directories
+        now = int(time.time())
+        metadata = self.get_directory_refresh_metadata()
+        stale_directories = set()
+        for directory in connected_directories:
+            row = metadata.get(directory, {})
+            last_response = row.get('last_orderbook_response_at') or \
+                row.get('last_seen_at') or row.get('last_successful_refresh_at')
+            if last_response is None or \
+                    now - int(last_response) >= \
+                    self.directory_source_stale_seconds:
+                stale_directories.add(directory)
+        return stale_directories
+
+    def selective_refresh_orderbook(self, reason, candidate_directories=None):
         if not self.refresh_run_lock.acquire(False):
             log.info('Skipping {} orderbook refresh; another refresh is '
                      'already in progress.'.format(reason))
-            self.request_orderbook()
             return False
         snapshot = self.snapshot_orderbook()
         before_offers = len(snapshot['orderbook'])
         before_fbonds = len(snapshot['fidelitybonds'])
+        refresh_id = self.make_refresh_id(reason)
+        try:
+            target_directories = self.get_stale_directory_locations(
+                candidate_directories)
+            if not target_directories:
+                log.info('Skipping {} orderbook refresh; all candidate '
+                         'directory sources are fresh.'.format(reason))
+                return True
+            self.begin_refresh_tracking(target_directories)
+            self.set_current_refresh_id(refresh_id)
+            log.info('Starting {} selective orderbook refresh for {} '
+                     'directory peers with snapshot of {} offers, {} '
+                     'fidelity bonds.'.format(
+                         reason, len(target_directories), before_offers,
+                         before_fbonds))
+            sent_directories = set()
+            try:
+                for directory in sorted(target_directories):
+                    self.record_orderbook_request(directory, refresh_id)
+                    if self.request_orderbook_from_directory(directory):
+                        sent_directories.add(directory)
+                    else:
+                        log.warning('Failed to send targeted orderbook '
+                                    'request to directory {}.'.format(
+                                        directory))
+            except Exception:
+                self.restore_orderbook_snapshot(snapshot)
+                self.pending_reconnect_refresh = True
+                raise
+            if not sent_directories:
+                self.restore_orderbook_snapshot(snapshot)
+                self.pending_reconnect_refresh = True
+                return False
+
+            time.sleep(max(
+                0, self.directory_refresh_response_timeout_seconds))
+            tracking_snapshot = self.get_refresh_tracking_snapshot()
+            disconnected_directories = \
+                tracking_snapshot['disconnected_directory_peers']
+            disconnected_directories |= (
+                sent_directories - self.get_connected_directory_locations())
+            responded_directories = (
+                tracking_snapshot['directory_peers'] & sent_directories)
+
+            if disconnected_directories and not responded_directories:
+                self.restore_orderbook_snapshot(snapshot)
+                self.pending_reconnect_refresh = True
+                log.warning('Restored previous orderbook snapshot after {} '
+                            'refresh; directory peers disconnected before '
+                            'responding: {}.'.format(
+                                reason,
+                                ','.join(sorted(disconnected_directories))))
+                return False
+
+            if responded_directories:
+                self.prune_unseen_sources_for_directories(
+                    responded_directories, refresh_id)
+                for directory in responded_directories:
+                    self.record_successful_refresh(directory, refresh_id)
+
+            missing_directories = sent_directories - responded_directories
+            self.pending_reconnect_refresh = bool(missing_directories)
+            after_offers, after_fbonds = self.get_orderbook_counts()
+            log.info('Completed {} selective orderbook refresh: {} '
+                     'directories responded, {} missing; current snapshot '
+                     'has {} offers, {} fidelity bonds.'.format(
+                         reason, len(responded_directories),
+                         len(missing_directories), after_offers,
+                         after_fbonds))
+            return not missing_directories
+        finally:
+            self.set_current_refresh_id(None)
+            self.end_refresh_tracking()
+            self.refresh_run_lock.release()
+
+    def refresh_orderbook_preserving_snapshot(self, reason):
+        if not self.refresh_run_lock.acquire(False):
+            log.info('Skipping {} orderbook refresh; another refresh is '
+                     'already in progress.'.format(reason))
+            return False
+        snapshot = self.snapshot_orderbook()
+        before_offers = len(snapshot['orderbook'])
+        before_fbonds = len(snapshot['fidelitybonds'])
+        refresh_id = self.make_refresh_id(reason)
         try:
             connected_directories = self.get_connected_directory_locations()
             if not connected_directories:
@@ -974,16 +1147,18 @@ class ObBasic(OrderbookWatch):
                             'no connected directory peers are available '
                             '({} offers, {} fidelity bonds).'.format(
                                 reason, before_offers, before_fbonds))
-                self.request_orderbook()
                 return False
 
             self.begin_refresh_tracking(connected_directories)
+            self.set_current_refresh_id(refresh_id)
             log.info('Starting {} orderbook refresh with {} connected '
                      'directory peers and snapshot of {} offers, {} '
                      'fidelity bonds.'.format(reason,
                                               len(connected_directories),
                                               before_offers, before_fbonds))
             try:
+                for directory in sorted(connected_directories):
+                    self.record_orderbook_request(directory, refresh_id)
                 self.request_orderbook()
             except Exception:
                 self.restore_orderbook_snapshot(snapshot)
@@ -1007,7 +1182,15 @@ class ObBasic(OrderbookWatch):
                                 ','.join(sorted(disconnected_directories))))
                 return False
 
-            self.prune_unseen_refresh_entries(tracking_snapshot)
+            responded_directories = (
+                tracking_snapshot['directory_peers'] & connected_directories)
+            if responded_directories:
+                self.prune_unseen_sources_for_directories(
+                    responded_directories, refresh_id)
+                for directory in responded_directories:
+                    self.record_successful_refresh(directory, refresh_id)
+            else:
+                self.prune_unseen_refresh_entries(tracking_snapshot)
             after_offers, after_fbonds = self.get_orderbook_counts()
             self.pending_reconnect_refresh = False
             log.info('Completed {} orderbook refresh: saw {} fresh offers; '
@@ -1015,12 +1198,13 @@ class ObBasic(OrderbookWatch):
                      .format(reason, seen_offers, after_offers, after_fbonds))
             return True
         finally:
+            self.set_current_refresh_id(None)
             self.end_refresh_tracking()
             self.refresh_run_lock.release()
 
-    def start_reconnect_orderbook_refresh(self, reason):
-        threading.Thread(target=self.refresh_orderbook_preserving_snapshot,
-                         args=(reason,),
+    def start_reconnect_orderbook_refresh(self, reason, target_directories):
+        threading.Thread(target=self.selective_refresh_orderbook,
+                         args=(reason, target_directories),
                          name='ReconnectOrderbookRefreshThread',
                          daemon=True).start()
 
@@ -1041,6 +1225,8 @@ class ObBasic(OrderbookWatch):
             peer_location = peer.peer_location()
         except Exception:
             peer_location = 'unknown'
+        if peer_location != 'unknown':
+            self.record_directory_connected(peer_location)
         now = time.monotonic()
         if self.reconnect_refresh_min_interval and \
                 now - self.last_reconnect_refresh_at < \
@@ -1049,10 +1235,17 @@ class ObBasic(OrderbookWatch):
                      'previous refresh was recent.'.format(peer_location))
             return
         self.last_reconnect_refresh_at = now
-        log.info('Directory peer {} connected; requesting orderbook '
-                 'refresh.'.format(peer_location))
+        if peer_location != 'unknown' and not \
+                self.get_stale_directory_locations({peer_location}):
+            log.info('Directory peer {} connected; source data is fresh, '
+                     'skipping targeted orderbook refresh.'.format(
+                         peer_location))
+            return
+        log.info('Directory peer {} connected; requesting targeted '
+                 'orderbook refresh.'.format(peer_location))
         self.start_reconnect_orderbook_refresh(
-            'directory peer {} connected'.format(peer_location))
+            'directory peer {} connected'.format(peer_location),
+            {peer_location} if peer_location != 'unknown' else None)
 
     def start_orderbook_refresh_once(self):
         if self.orderbook_refresh_thread_started:
@@ -1071,8 +1264,8 @@ class ObBasic(OrderbookWatch):
         while True:
             time.sleep(self.orderbook_refresh_interval)
             try:
-                log.info('Requesting periodic orderbook refresh.')
-                self.request_orderbook()
+                log.info('Requesting periodic selective orderbook refresh.')
+                self.selective_refresh_orderbook('periodic')
             except Exception as e:
                 log.warning('Periodic orderbook refresh failed: ' + repr(e))
 
@@ -1087,11 +1280,17 @@ class ObBasic(OrderbookWatch):
     def request_orderbook(self):
         self.msgchan.request_orderbook()
 
+    def request_orderbook_from_directory(self, directory_location):
+        if hasattr(self.msgchan, 'request_orderbook_from_directory'):
+            return self.msgchan.request_orderbook_from_directory(
+                directory_location)
+        return False
+
 
 """An override for MessageChannel classes,
 to allow receipt of privmsgs without the
 verification hooks in client-daemon communication."""
-def on_privmsg(inst, nick, message):
+def on_privmsg(inst, nick, message, source_directory=None):
     if len(message) < 2:
         return
 
@@ -1099,7 +1298,7 @@ def on_privmsg(inst, nick, message):
         log.debug('message not a cmd')
         return
     cmd_string = message[1:].split(' ')[0]
-    if cmd_string not in offername_list:
+    if cmd_string not in offername_list + fidelity_bond_cmd_list:
         log.debug('non-offer ignored')
         return
     #Ignore sigs (TODO better to include check)
@@ -1109,8 +1308,8 @@ def on_privmsg(inst, nick, message):
     for command in rawmessage.split(COMMAND_PREFIX):
         _chunks = command.split(" ")
         try:
-            inst.check_for_orders(nick, _chunks)
-            inst.check_for_fidelity_bond(nick, _chunks)
+            inst.check_for_orders(nick, _chunks, source_directory)
+            inst.check_for_fidelity_bond(nick, _chunks, source_directory)
         except:
             pass
 

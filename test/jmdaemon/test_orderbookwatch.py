@@ -98,6 +98,36 @@ def test_order_seen_cancel(counterparty, oid, ordertype, minsize, maxsize, txfee
         orderbook = [dict([(k, o[k]) for k in ORDER_KEYS]) for o in rows]
         assert len(orderbook) == 0
 
+def test_order_sources_are_pruned_per_directory():
+    ob = get_ob()
+    offer = ("J5SourceMaker", "0", "reloffer", "3000", "4000", "2", "0.3")
+    ob.on_order_seen(*offer, source_directory="dn1.onion:5222")
+    ob.on_order_seen(*offer, source_directory="dn2.onion:5222")
+
+    rows = ob.db.execute('SELECT * FROM orderbook;').fetchall()
+    assert len(rows) == 1
+    source_rows = ob.db.execute(
+        'SELECT * FROM orderbook_sources;').fetchall()
+    assert len(source_rows) == 2
+
+    ob.on_order_cancel("J5SourceMaker", "0", "dn1.onion:5222")
+    rows = ob.db.execute('SELECT * FROM orderbook;').fetchall()
+    assert len(rows) == 1
+    source_rows = ob.db.execute(
+        'SELECT * FROM orderbook_sources;').fetchall()
+    assert len(source_rows) == 1
+    assert source_rows[0]["directory"] == "dn2.onion:5222"
+
+    ob.set_current_refresh_id("refresh-1")
+    ob.on_order_seen(*offer, source_directory="dn2.onion:5222")
+    ob.set_current_refresh_id(None)
+    ob.prune_unseen_sources_for_directories(["dn2.onion:5222"], "refresh-2")
+    rows = ob.db.execute('SELECT * FROM orderbook;').fetchall()
+    assert len(rows) == 0
+    source_rows = ob.db.execute(
+        'SELECT * FROM orderbook_sources;').fetchall()
+    assert len(source_rows) == 0
+
 def test_disconnect_leave():
     ob = get_ob()
     t_orderbook = [{u'counterparty': u'J5FA1Gj7Ln4vSGne', u'ordertype': u'reloffer', u'oid': 0,

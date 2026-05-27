@@ -14,6 +14,14 @@ from functools import wraps
 log = get_log()
 
 
+def _call_orderbook_callback(callback, *args, source_directory=None):
+    if not callback:
+        return None
+    if source_directory is None:
+        return callback(*args)
+    return callback(*args, source_directory)
+
+
 class CJPeerError(Exception):
     pass
 
@@ -204,6 +212,19 @@ class MessageChannelCollection(object):
     def request_orderbook(self):
         for mc in self.available_channels():
             mc.request_orderbook()
+
+    def request_orderbook_from_directory(self, directory_location):
+        requested = False
+        for mc in self.available_channels():
+            requested = mc.request_orderbook_from_directory(
+                directory_location) or requested
+        return requested
+
+    def pubmsg_to_directory(self, directory_location, msg):
+        sent = False
+        for mc in self.available_channels():
+            sent = mc.pubmsg_to_directory(directory_location, msg) or sent
+        return sent
 
     #END PUBLIC/BROADCAST SECTION
 
@@ -454,7 +475,7 @@ class MessageChannelCollection(object):
             self.on_welcome()
         self.welcomed = True
 
-    def on_nick_leave_trigger(self, nick, mc):
+    def on_nick_leave_trigger(self, nick, mc, source_directory=None):
         """If a nick leaves one message channel,
         and we are currently talking to it on that
         channel, attempt to dynamically switch to
@@ -465,6 +486,11 @@ class MessageChannelCollection(object):
         If we are not currently talking to it at all,
         just call on_nick_leave (which currently does nothing).
         """
+
+        if source_directory is not None:
+            _call_orderbook_callback(
+                self.on_nick_leave, nick, source_directory=source_directory)
+            return
 
         #mark the nick as 'unseen' on that channel
         self.unsee_nick(nick, mc)
@@ -545,7 +571,7 @@ class MessageChannelCollection(object):
             self.on_nick_change(new_nick)
 
     def on_order_seen_trigger(self, mc, counterparty, oid, ordertype, minsize,
-                              maxsize, txfee, cjfee):
+                              maxsize, txfee, cjfee, source_directory=None):
         """This is the entry point into private messaging.
         Hence, it fixes for the rest of the conversation, which
         message channel the bots are going to communicate over
@@ -562,9 +588,25 @@ class MessageChannelCollection(object):
         self.nicks_seen[mc].add(counterparty)
 
         self.active_channels[counterparty] = mc
-        if self.on_order_seen:
-            self.on_order_seen(counterparty, oid, ordertype, minsize, maxsize,
-                               txfee, cjfee)
+        _call_orderbook_callback(
+            self.on_order_seen, counterparty, oid, ordertype, minsize, maxsize,
+            txfee, cjfee, source_directory=source_directory)
+
+    def _make_order_cancel_trigger(self, mc):
+        def on_order_cancel(counterparty, oid, source_directory=None):
+            _call_orderbook_callback(
+                self.on_order_cancel, counterparty, oid,
+                source_directory=source_directory)
+        return on_order_cancel
+
+    def _make_fidelity_bond_seen_trigger(self, mc):
+        def on_fidelity_bond_seen(nick, bond_type, proof, source_directory=None):
+            self.nicks_seen[mc].add(nick)
+            self.active_channels[nick] = mc
+            _call_orderbook_callback(
+                self.on_fidelity_bond_seen, nick, bond_type, proof,
+                source_directory=source_directory)
+        return on_fidelity_bond_seen
 
     # orderbook watcher commands
     def register_orderbookwatch_callbacks(self,
@@ -577,9 +619,12 @@ class MessageChannelCollection(object):
         but not another? TODO
         """
         self.on_order_seen = on_order_seen
+        self.on_order_cancel = on_order_cancel
+        self.on_fidelity_bond_seen = on_fidelity_bond_seen
         for mc in self.mchannels:
             mc.register_orderbookwatch_callbacks(self.on_order_seen_trigger,
-                                     on_order_cancel, on_fidelity_bond_seen)
+                                     self._make_order_cancel_trigger(mc),
+                                     self._make_fidelity_bond_seen_trigger(mc))
 
     def on_orderbook_requested_trigger(self, nick, mc):
         """Update nicks_seen state to reflect presence of
@@ -666,6 +711,7 @@ class MessageChannel(object):
         self.on_seen_auth = None
         self.on_seen_tx = None
         self.on_push_tx = None
+        self._pending_privmsg_sources = {}
 
         self.daemon = None
 
@@ -775,7 +821,7 @@ class MessageChannel(object):
     def announce_orders(self, orderlines):
         self._announce_orders(orderlines)
 
-    def check_for_orders(self, nick, _chunks):
+    def check_for_orders(self, nick, _chunks, source_directory=None):
         if _chunks[0] in offername_list:
             try:
                 counterparty = nick
@@ -785,9 +831,10 @@ class MessageChannel(object):
                 maxsize = _chunks[3]
                 txfee = _chunks[4]
                 cjfee = _chunks[5]
-                if self.on_order_seen:
-                    self.on_order_seen(self, counterparty, oid, ordertype,
-                                       minsize, maxsize, txfee, cjfee)
+                _call_orderbook_callback(
+                    self.on_order_seen, self, counterparty, oid, ordertype,
+                    minsize, maxsize, txfee, cjfee,
+                    source_directory=source_directory)
             except IndexError as e:
                 log.debug(e)
                 log.debug('index error parsing chunks, possibly malformed '
@@ -823,12 +870,13 @@ class MessageChannel(object):
                 return True
         return False
 
-    def check_for_fidelity_bond(self, nick, _chunks):
+    def check_for_fidelity_bond(self, nick, _chunks, source_directory=None):
         if _chunks[0] in fidelity_bond_cmd_list:
             try:
                 fidelity_bond_proof_msg = _chunks[1]
-                if self.on_fidelity_bond_seen:
-                    self.on_fidelity_bond_seen(nick, _chunks[0], fidelity_bond_proof_msg)
+                _call_orderbook_callback(
+                    self.on_fidelity_bond_seen, nick, _chunks[0],
+                    fidelity_bond_proof_msg, source_directory=source_directory)
             except IndexError as e:
                 log.debug(e)
                 log.debug('index error parsing chunks, possibly malformed '
@@ -845,6 +893,13 @@ class MessageChannel(object):
     # OrderbookWatch callback
     def request_orderbook(self):
         self.pubmsg(COMMAND_PREFIX + 'orderbook')
+
+    def request_orderbook_from_directory(self, directory_location):
+        return self.pubmsg_to_directory(
+            directory_location, COMMAND_PREFIX + 'orderbook')
+
+    def pubmsg_to_directory(self, directory_location, msg):
+        return False
 
     # Taker callbacks
     def fill_orders(self, nick_order_dict, cj_amount, taker_pubkey, commitment):
@@ -877,7 +932,7 @@ class MessageChannel(object):
         #forward to the implementation class (use single _ for polymrphsm to work)
         self._privmsg(nick, cmd, message)
 
-    def on_pubmsg(self, nick, message):
+    def on_pubmsg(self, nick, message, source_directory=None):
         #Even illegal messages mark a nick as "seen"
         if self.on_pubmsg_trigger:
             self.on_pubmsg_trigger(nick, self)
@@ -889,7 +944,7 @@ class MessageChannel(object):
             return
         for command in commands:
             _chunks = command.split(" ")
-            if self.check_for_orders(nick, _chunks):
+            if self.check_for_orders(nick, _chunks, source_directory):
                 pass
             if self.check_for_commitments(nick, _chunks):
                 pass
@@ -897,8 +952,9 @@ class MessageChannel(object):
                 # !cancel [oid]
                 try:
                     oid = int(_chunks[1])
-                    if self.on_order_cancel:
-                        self.on_order_cancel(nick, oid)
+                    _call_orderbook_callback(
+                        self.on_order_cancel, nick, oid,
+                        source_directory=source_directory)
                 except (ValueError, IndexError) as e:
                     log.debug("!cancel " + repr(e))
                     return
@@ -910,7 +966,7 @@ class MessageChannel(object):
                 if hasattr(self, 'debug_on_pubmsg_cmd'):
                     self.debug_on_pubmsg_cmd(nick, _chunks)
 
-    def on_privmsg(self, nick, message):
+    def on_privmsg(self, nick, message, source_directory=None):
         """handles the case when a private message is received"""
         #Aberrant short messages should be handled by subclasses
         #in _privmsg, but this constitutes a sanity check. Note that
@@ -949,11 +1005,15 @@ class MessageChannel(object):
         except Exception:
             log.debug(badsigmsg)
             return
+        if source_directory is not None:
+            self._pending_privmsg_sources[(nick, message)] = source_directory
         self.daemon.request_signature_verify(
             rawmessage + str(self.hostid), message, sig, pub, nick,
             NICK_HASH_LENGTH, NICK_MAX_ENCODED, str(self.hostid))
 
     def on_verified_privmsg(self, nick, message):
+        source_directory = self._pending_privmsg_sources.pop(
+            (nick, message), None)
         #Marks the nick as active on this channel; note *only* if verified.
         #Otherwise squatter/attacker can persuade us to send privmsgs to him.
         if self.on_privmsg_trigger:
@@ -989,9 +1049,10 @@ class MessageChannel(object):
 
             try:
                 # orderbook watch commands
-                if self.check_for_orders(nick, _chunks):
+                if self.check_for_orders(nick, _chunks, source_directory):
                     pass
-                elif self.check_for_fidelity_bond(nick, _chunks):
+                elif self.check_for_fidelity_bond(
+                        nick, _chunks, source_directory):
                     pass
                 # taker commands
                 elif _chunks[0] == 'error':
