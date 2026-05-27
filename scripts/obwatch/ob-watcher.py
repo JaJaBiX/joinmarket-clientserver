@@ -1270,6 +1270,8 @@ class ObBasic(OrderbookWatch):
         a twisted http server here instead
         of a thread."""
         self.start_http_server_once()
+        for directory in sorted(self.get_connected_directory_locations()):
+            self.record_orderbook_request(directory, 'startup')
         self.request_orderbook()
 
     def request_orderbook(self):
