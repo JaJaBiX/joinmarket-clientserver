@@ -135,6 +135,74 @@ def test_order_sources_are_pruned_per_directory():
         'SELECT * FROM orderbook_sources;').fetchall()
     assert len(source_rows) == 0
 
+def test_visible_orderbook_requires_active_connected_source():
+    ob = get_ob()
+    offer = ("J5VisibleMaker", "0", "reloffer", "3000", "4000", "2", "0.3")
+    dn1 = "dn1.onion:5222"
+    dn2 = "dn2.onion:5222"
+
+    ob.on_order_seen(*offer)
+    assert len(ob.get_raw_orderbook_rows()) == 1
+    assert len(ob.get_visible_orderbook_rows()) == 0
+
+    ob.on_order_seen(*offer, source_directory=dn1)
+    assert len(ob.get_visible_orderbook_rows()) == 1
+
+    ob.on_order_seen(*offer, source_directory=dn2)
+    assert len(ob.get_raw_orderbook_rows()) == 1
+    assert len(ob.get_visible_orderbook_rows()) == 1
+
+    ob.record_directory_disconnected(dn1)
+    assert len(ob.get_visible_orderbook_rows()) == 1
+
+    ob.record_directory_disconnected(dn2)
+    assert len(ob.get_raw_orderbook_rows()) == 1
+    assert len(ob.get_visible_orderbook_rows()) == 0
+
+    ob.record_directory_connected(dn2)
+    assert len(ob.get_visible_orderbook_rows()) == 1
+
+    ob.on_order_cancel("J5VisibleMaker", "0", source_directory=dn2)
+    assert len(ob.get_raw_orderbook_rows()) == 1
+    assert len(ob.get_visible_orderbook_rows()) == 0
+
+def test_visible_fidelitybonds_require_active_connected_source():
+    ob = get_ob()
+    maker = "J5VisibleBond"
+    dn1 = "dn1.onion:5222"
+    dn2 = "dn2.onion:5222"
+
+    ob.db.execute("INSERT INTO fidelitybonds VALUES(?, ?, ?);",
+                  (maker, "J5Taker", "proof"))
+    ob.db.execute(
+        "INSERT INTO fidelitybond_sources VALUES(?, ?, ?, ?, ?, ?, ?);",
+        (maker, dn1, 1, 1, "refresh-1", 1, None))
+    assert len(ob.get_raw_fidelitybond_rows()) == 1
+    assert len(ob.get_visible_fidelitybond_rows()) == 0
+
+    ob.record_directory_connected(dn1)
+    assert len(ob.get_visible_fidelitybond_rows()) == 1
+
+    ob.db.execute(
+        "INSERT INTO fidelitybond_sources VALUES(?, ?, ?, ?, ?, ?, ?);",
+        (maker, dn2, 1, 1, "refresh-1", 1, None))
+    ob.record_directory_connected(dn2)
+    assert len(ob.get_visible_fidelitybond_rows()) == 1
+
+    ob.record_directory_disconnected(dn1)
+    assert len(ob.get_visible_fidelitybond_rows()) == 1
+
+    ob.record_directory_disconnected(dn2)
+    assert len(ob.get_raw_fidelitybond_rows()) == 1
+    assert len(ob.get_visible_fidelitybond_rows()) == 0
+
+    ob.record_directory_connected(dn2)
+    assert len(ob.get_visible_fidelitybond_rows()) == 1
+
+    ob.on_nick_leave(maker, source_directory=dn2)
+    assert len(ob.get_raw_fidelitybond_rows()) == 1
+    assert len(ob.get_visible_fidelitybond_rows()) == 0
+
 def test_directory_message_metadata_tracks_relayed_orderbook_requests():
     ob = get_ob()
     directory = "dn1.onion:5222"

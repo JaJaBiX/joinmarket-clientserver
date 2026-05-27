@@ -158,8 +158,7 @@ def create_choose_units_form(selected_btc, selected_rel):
     return choose_units_form
 
 def get_fidelity_bond_data(taker):
-    with taker.dblock:
-        fbonds = taker.db.execute("SELECT * FROM fidelitybonds;").fetchall()
+    fbonds = taker.get_visible_fidelitybond_rows()
 
     blocks = jm_single().bc_interface.get_current_block_height()
     mediantime = jm_single().bc_interface.get_best_block_median_time()
@@ -213,9 +212,8 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
                 directory=os.path.dirname(os.path.realpath(__file__)))
 
     def create_orderbook_obj(self):
-        with self.taker.dblock:
-            rows = self.taker.db.execute('SELECT * FROM orderbook;').fetchall()
-            fbonds = self.taker.db.execute("SELECT * FROM fidelitybonds;").fetchall()
+        rows = self.taker.get_visible_orderbook_rows()
+        fbonds = self.taker.get_visible_fidelitybond_rows()
 
         fidelitybonds = []
         if fbonds and jm_single().bc_interface != None:
@@ -274,11 +272,7 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
 
         if args is None:
             args = {}
-        try:
-            self.taker.dblock.acquire(True)
-            rows = self.taker.db.execute('SELECT * FROM orderbook;').fetchall()
-        finally:
-            self.taker.dblock.release()
+        rows = self.taker.get_visible_orderbook_rows()
         sqlorders = [o for o in rows if o["ordertype"] in filtered_offername_list]
         orderfees = sorted([calc_cj_fee(o['ordertype'], o['cjfee'], cj_amount) / 1e8
                             for o in sqlorders
@@ -318,11 +312,7 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
         if 'matplotlib' not in sys.modules:
             return 'matplotlib not installed, charts not available'
 
-        try:
-            self.taker.dblock.acquire(True)
-            rows = self.taker.db.execute('SELECT maxsize, ordertype FROM orderbook;').fetchall()
-        finally:
-            self.taker.dblock.release()
+        rows = self.taker.get_visible_orderbook_rows()
         rows = [o for o in rows if o["ordertype"] in filtered_offername_list]
         ordersizes = sorted([r['maxsize'] / 1e8 for r in rows])
 
@@ -345,8 +335,7 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
 
     def create_fidelity_bond_table(self, btc_unit: str) -> Tuple[str, str]:
         if jm_single().bc_interface == None:
-            with self.taker.dblock:
-                fbonds = self.taker.db.execute("SELECT * FROM fidelitybonds;").fetchall()
+            fbonds = self.taker.get_visible_fidelitybond_rows()
             fidelity_bond_data = []
             for fb in fbonds:
                 try:
@@ -510,11 +499,7 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
 
     def create_orderbook_table(self, btc_unit: str, rel_unit: str) -> Tuple[int, str]:
         result = ''
-        try:
-            self.taker.dblock.acquire(True)
-            rows = self.taker.db.execute('SELECT * FROM orderbook;').fetchall()
-        finally:
-            self.taker.dblock.release()
+        rows = self.taker.get_visible_orderbook_rows()
         if not rows:
             return 0, result
         rows = [o for o in rows if o["ordertype"] in filtered_offername_list]
@@ -526,20 +511,20 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
             blocks = jm_single().bc_interface.get_current_block_height()
             mediantime = jm_single().bc_interface.get_best_block_median_time()
             interest_rate = get_interest_rate()
+            fbonds_by_counterparty = dict([
+                (fbond["counterparty"], fbond)
+                for fbond in self.taker.get_visible_fidelitybond_rows()])
             for row in rows:
-                with self.taker.dblock:
-                    fbond_data = self.taker.db.execute(
-                        "SELECT * FROM fidelitybonds WHERE counterparty=?;", (row["counterparty"],)
-                    ).fetchall()
-                if len(fbond_data) == 0:
+                fbond_data = fbonds_by_counterparty.get(row["counterparty"])
+                if fbond_data is None:
                     row["bondvalue"] = "0"
                     continue
                 else:
                     try:
                         parsed_bond = FidelityBondProof.parse_and_verify_proof_msg(
-                            fbond_data[0]["counterparty"],
-                            fbond_data[0]["takernick"],
-                            fbond_data[0]["proof"]
+                            fbond_data["counterparty"],
+                            fbond_data["takernick"],
+                            fbond_data["proof"]
                         )
                     except ValueError:
                         row["bondvalue"] = "0"
@@ -605,13 +590,10 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
         return len(rows), result
 
     def get_counterparty_count(self):
-        try:
-            self.taker.dblock.acquire(True)
-            counterparties = self.taker.db.execute(
-                'SELECT DISTINCT counterparty FROM orderbook WHERE ordertype=? OR ordertype=?;',
-                filtered_offername_list).fetchall()
-        finally:
-            self.taker.dblock.release()
+        rows = self.taker.get_visible_orderbook_rows()
+        counterparties = set(
+            [row["counterparty"] for row in rows
+             if row["ordertype"] in filtered_offername_list])
         return str(len(counterparties))
 
     def do_GET(self):
@@ -909,12 +891,8 @@ class ObBasic(OrderbookWatch):
                         offers, fbonds))
 
     def get_orderbook_counts(self):
-        with self.dblock:
-            offers = self.db.execute(
-                'SELECT COUNT(*) AS count FROM orderbook;').fetchone()
-            fbonds = self.db.execute(
-                'SELECT COUNT(*) AS count FROM fidelitybonds;').fetchone()
-        return offers['count'], fbonds['count']
+        return (len(self.get_visible_orderbook_rows()),
+                len(self.get_visible_fidelitybond_rows()))
 
     def get_connected_directory_locations(self):
         channels = getattr(self.msgchan, 'mchannels', [self.msgchan])

@@ -70,6 +70,26 @@ class OrderbookWatch(object):
                             "orderbook_request_rx_count INTEGER, "
                             "last_non_orderbook_message_at INTEGER, "
                             "status TEXT);")
+            self.db.execute("CREATE VIEW visible_orderbook AS "
+                            "SELECT o.counterparty, o.oid, o.ordertype, "
+                            "o.minsize, o.maxsize, o.txfee, o.cjfee "
+                            "FROM orderbook AS o WHERE EXISTS ("
+                            "SELECT 1 FROM orderbook_sources AS os "
+                            "JOIN directory_peers AS dp "
+                            "ON dp.directory = os.directory "
+                            "WHERE os.counterparty = o.counterparty "
+                            "AND os.oid = o.oid "
+                            "AND os.active = 1 "
+                            "AND dp.status = 'connected');")
+            self.db.execute("CREATE VIEW visible_fidelitybonds AS "
+                            "SELECT f.counterparty, f.takernick, f.proof "
+                            "FROM fidelitybonds AS f WHERE EXISTS ("
+                            "SELECT 1 FROM fidelitybond_sources AS fs "
+                            "JOIN directory_peers AS dp "
+                            "ON dp.directory = fs.directory "
+                            "WHERE fs.counterparty = f.counterparty "
+                            "AND fs.active = 1 "
+                            "AND dp.status = 'connected');")
         finally:
             self.dblock.release()
 
@@ -466,6 +486,38 @@ class OrderbookWatch(object):
             self.dblock.acquire(True)
             self.db.execute("SELECT * FROM fidelitybond_sources ORDER BY "
                             "directory, counterparty;")
+            return self.db.fetchall()
+        finally:
+            self.dblock.release()
+
+    def get_visible_orderbook_rows(self):
+        try:
+            self.dblock.acquire(True)
+            self.db.execute("SELECT * FROM visible_orderbook;")
+            return self.db.fetchall()
+        finally:
+            self.dblock.release()
+
+    def get_visible_fidelitybond_rows(self):
+        try:
+            self.dblock.acquire(True)
+            self.db.execute("SELECT * FROM visible_fidelitybonds;")
+            return self.db.fetchall()
+        finally:
+            self.dblock.release()
+
+    def get_raw_orderbook_rows(self):
+        try:
+            self.dblock.acquire(True)
+            self.db.execute("SELECT * FROM orderbook;")
+            return self.db.fetchall()
+        finally:
+            self.dblock.release()
+
+    def get_raw_fidelitybond_rows(self):
+        try:
+            self.dblock.acquire(True)
+            self.db.execute("SELECT * FROM fidelitybonds;")
             return self.db.fetchall()
         finally:
             self.dblock.release()

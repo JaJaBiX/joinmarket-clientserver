@@ -668,11 +668,11 @@ class JMDaemonServerProtocol(amp.AMP, OrderbookWatch):
     def on_JM_REQUEST_OFFERS(self):
         """Reports the current state of the orderbook.
         This call is stateless."""
-        rows = self.db.execute('SELECT * FROM orderbook;').fetchall()
+        rows = self.get_visible_orderbook_rows()
         self.orderbook = [dict([(k, o[k]) for k in ORDER_KEYS]) for o in rows]
         string_orderbook = json.dumps(self.orderbook)
 
-        fbond_rows = self.db.execute("SELECT * FROM fidelitybonds;").fetchall()
+        fbond_rows = self.get_visible_fidelitybond_rows()
         fidelitybonds = [fb for fb in fbond_rows]
         string_fidelitybonds = json.dumps(fidelitybonds)
 
@@ -1034,10 +1034,14 @@ class JMDaemonServerProtocol(amp.AMP, OrderbookWatch):
         """Send this commitment via privmsg to one (random)
         other maker.
         """
-        crow = self.db.execute(
-                        'SELECT DISTINCT counterparty FROM orderbook ORDER BY ' +
-                        'RANDOM() LIMIT 1;'
-                    ).fetchone()
+        try:
+            self.dblock.acquire(True)
+            crow = self.db.execute(
+                            'SELECT DISTINCT counterparty FROM '
+                            'visible_orderbook ORDER BY RANDOM() LIMIT 1;'
+                        ).fetchone()
+        finally:
+            self.dblock.release()
         if crow is None:
             return
         counterparty = crow['counterparty']
