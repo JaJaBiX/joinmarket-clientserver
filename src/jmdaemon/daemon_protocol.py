@@ -521,6 +521,41 @@ class JMDaemonServerProtocol(amp.AMP, OrderbookWatch):
         d.addCallback(self.checkClientResponse)
         d.addErrback(self.defaultErrback)
 
+    def register_directory_connected_hooks(self):
+        if not self.mcc:
+            return
+        channels = getattr(self.mcc, "mchannels", [self.mcc])
+        for mc in channels:
+            if not hasattr(mc, "on_directory_peer_connected"):
+                continue
+            existing_hook = mc.on_directory_peer_connected
+
+            def directory_connected_hook(peer, existing_hook=existing_hook):
+                if existing_hook:
+                    existing_hook(peer)
+                self.on_directory_peer_connected(peer)
+
+            mc.on_directory_peer_connected = directory_connected_hook
+
+    def on_directory_peer_connected(self, peer):
+        try:
+            peer_location = peer.peer_location()
+        except Exception:
+            peer_location = None
+        if not peer_location:
+            return
+
+        self.record_directory_connected(peer_location)
+        refresh_id = "directory-connect"
+        self.record_orderbook_request(peer_location, refresh_id)
+        if hasattr(self.mcc, "request_orderbook_from_directory"):
+            self.mcc.request_orderbook_from_directory(peer_location)
+
+        if self.role == "MAKER" and self.offerlist and \
+                hasattr(self.mcc, "announce_orders_to_directory"):
+            self.mcc.announce_orders_to_directory(
+                peer_location, self.offerlist)
+
     @JMInit.responder
     def on_JM_INIT(self, bcsource, network, chan_configs, minmakers,
                    maker_timeout_sec, dust_threshold, blacklist_location):
@@ -568,6 +603,7 @@ class JMDaemonServerProtocol(amp.AMP, OrderbookWatch):
                                               self.on_commitment_seen,
                                               self.on_commitment_transferred)
             self.mcc.set_daemon(self)
+            self.register_directory_connected_hooks()
         d = self.callRemote(JMInitProto,
                             nick_hash_length=NICK_HASH_LENGTH,
                             nick_max_encoded=NICK_MAX_ENCODED,

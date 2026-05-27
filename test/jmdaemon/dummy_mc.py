@@ -27,6 +27,7 @@ class DummyMessageChannel(MessageChannel):
         if hostid:
             self.hostid = hostid
         self.serverport = self.hostid
+        self.directory_pubmsgs = []
 
     def __str__(self):
         return self.hostid
@@ -57,6 +58,9 @@ class DummyMessageChannel(MessageChannel):
         """
     def _announce_orders(self, orderlist):
         pass
+    def pubmsg_to_directory(self, directory_location, msg):
+        self.directory_pubmsgs.append((directory_location, msg))
+        return True
     def change_nick(self, new_nick):
         print("Changing nick supposedly")
     

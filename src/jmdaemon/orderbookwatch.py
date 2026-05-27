@@ -1,6 +1,5 @@
 #! /usr/bin/env python
 
-import hashlib
 import sqlite3
 import sys
 import threading
@@ -22,6 +21,10 @@ class OrderbookWatch(object):
     def set_msgchan(self, msgchan):
         self.msgchan = msgchan
         self.current_refresh_id = None
+        if not hasattr(self, "source_inactive_grace_seconds"):
+            self.source_inactive_grace_seconds = -1
+        if not hasattr(self, "orphan_source_retention_seconds"):
+            self.orphan_source_retention_seconds = 0
         self.msgchan.register_orderbookwatch_callbacks(self.on_order_seen,
                                self.on_order_cancel, self.on_fidelity_bond_seen)
         self.msgchan.register_channel_callbacks(
@@ -41,16 +44,15 @@ class OrderbookWatch(object):
                 "takernick TEXT, proof TEXT);");
             self.db.execute("CREATE TABLE orderbook_sources("
                             "counterparty TEXT, oid INTEGER, directory TEXT, "
-                            "ordertype TEXT, minsize INTEGER, "
-                            "maxsize INTEGER, txfee INTEGER, cjfee TEXT, "
-                            "offer_hash TEXT, first_seen_at INTEGER, "
-                            "last_seen_at INTEGER, last_refresh_id TEXT, "
+                            "first_seen_at INTEGER, last_seen_at INTEGER, "
+                            "last_refresh_id TEXT, active INTEGER DEFAULT 1, "
+                            "inactive_at INTEGER, "
                             "PRIMARY KEY(counterparty, oid, directory));")
             self.db.execute("CREATE TABLE fidelitybond_sources("
                             "counterparty TEXT, directory TEXT, "
-                            "takernick TEXT, proof TEXT, proof_hash TEXT, "
                             "first_seen_at INTEGER, last_seen_at INTEGER, "
-                            "last_refresh_id TEXT, "
+                            "last_refresh_id TEXT, active INTEGER DEFAULT 1, "
+                            "inactive_at INTEGER, "
                             "PRIMARY KEY(counterparty, directory));")
             self.db.execute("CREATE TABLE directory_peers("
                             "directory TEXT PRIMARY KEY, "
@@ -65,6 +67,8 @@ class OrderbookWatch(object):
                             "last_orderbook_response_at INTEGER, "
                             "last_successful_refresh_at INTEGER, "
                             "last_refresh_id TEXT, rx_message_count INTEGER, "
+                            "orderbook_request_rx_count INTEGER, "
+                            "last_non_orderbook_message_at INTEGER, "
                             "status TEXT);")
         finally:
             self.dblock.release()
@@ -72,16 +76,6 @@ class OrderbookWatch(object):
     @staticmethod
     def _now():
         return int(time.time())
-
-    @staticmethod
-    def _offer_hash(ordertype, minsize, maxsize, txfee, cjfee):
-        payload = "|".join([str(ordertype), str(minsize), str(maxsize),
-                            str(txfee), str(cjfee)])
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _proof_hash(proof):
-        return hashlib.sha256(str(proof).encode("utf-8")).hexdigest()
 
     def set_current_refresh_id(self, refresh_id):
         self.current_refresh_id = refresh_id
@@ -92,8 +86,8 @@ class OrderbookWatch(object):
         if self.db.fetchone():
             return
         self.db.execute(
-            ("INSERT INTO directory_peers(directory, rx_message_count) "
-             "VALUES(?, 0);"),
+            ("INSERT INTO directory_peers(directory, rx_message_count, "
+             "orderbook_request_rx_count) VALUES(?, 0, 0);"),
             (directory,))
 
     def _set_directory_peer_fields_locked(self, directory, **fields):
@@ -161,15 +155,25 @@ class OrderbookWatch(object):
         try:
             self.dblock.acquire(True)
             fields = {"last_message_at": now, "status": "connected"}
+            has_orderbook_request = False
             if is_pubmsg:
                 fields["last_pubmsg_at"] = now
                 if self._pubmsg_has_orderbook_request(message):
+                    has_orderbook_request = True
                     fields["last_orderbook_request_seen_at"] = now
+            if not has_orderbook_request:
+                fields["last_non_orderbook_message_at"] = now
             self._set_directory_peer_fields_locked(directory, **fields)
             self.db.execute(
                 ("UPDATE directory_peers SET "
                  "rx_message_count=COALESCE(rx_message_count, 0) + 1 "
                  "WHERE directory=?;"), (directory,))
+            if has_orderbook_request:
+                self.db.execute(
+                    ("UPDATE directory_peers SET "
+                     "orderbook_request_rx_count="
+                     "COALESCE(orderbook_request_rx_count, 0) + 1 "
+                     "WHERE directory=?;"), (directory,))
         finally:
             self.dblock.release()
 
@@ -191,41 +195,219 @@ class OrderbookWatch(object):
             fields["last_refresh_id"] = self.current_refresh_id
         self._set_directory_peer_fields_locked(directory, **fields)
 
-    def _upsert_order_source_locked(self, counterparty, oid, directory,
-                                    ordertype, minsize, maxsize, txfee, cjfee,
-                                    now):
+    def _upsert_order_source_locked(self, counterparty, oid, directory, now):
         self.db.execute(
             ("SELECT first_seen_at FROM orderbook_sources WHERE "
              "counterparty=? AND oid=? AND directory=?;"),
             (counterparty, oid, directory))
         row = self.db.fetchone()
         first_seen_at = row["first_seen_at"] if row else now
-        offer_hash = self._offer_hash(ordertype, minsize, maxsize, txfee, cjfee)
         self.db.execute(
             ("INSERT OR REPLACE INTO orderbook_sources VALUES"
-             "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"),
-            (counterparty, oid, directory, ordertype, minsize, maxsize, txfee,
-             cjfee, offer_hash, first_seen_at, now, self.current_refresh_id))
+             "(?, ?, ?, ?, ?, ?, ?, ?);"),
+            (counterparty, oid, directory, first_seen_at, now,
+             self.current_refresh_id, 1, None))
 
-    def _restore_order_from_sources_locked(self, counterparty, oid):
+    def _deactivate_order_source_locked(self, counterparty, oid, directory,
+                                        now):
         self.db.execute(
-            ("DELETE FROM orderbook WHERE counterparty=? AND oid=?;"),
+            ("UPDATE orderbook_sources SET active=0, "
+             "inactive_at=COALESCE(inactive_at, ?) "
+             "WHERE counterparty=? AND oid=? AND directory=?;"),
+            (now, counterparty, oid, directory))
+
+    def _deactivate_fidelitybond_source_locked(self, counterparty, directory,
+                                               now):
+        self.db.execute(
+            ("UPDATE fidelitybond_sources SET active=0, "
+             "inactive_at=COALESCE(inactive_at, ?) "
+             "WHERE counterparty=? AND directory=?;"),
+            (now, counterparty, directory))
+
+    def _has_active_order_source_locked(self, counterparty, oid):
+        self.db.execute(
+            ("SELECT 1 FROM orderbook_sources WHERE counterparty=? AND "
+             "oid=? AND active=1 LIMIT 1;"),
             (counterparty, oid))
+        return self.db.fetchone() is not None
+
+    def _has_any_order_source_locked(self, counterparty, oid):
         self.db.execute(
-            ("SELECT ordertype, minsize, maxsize, txfee, cjfee FROM "
-             "orderbook_sources WHERE counterparty=? AND oid=? "
-             "ORDER BY last_seen_at DESC LIMIT 1;"),
+            ("SELECT 1 FROM orderbook_sources WHERE counterparty=? AND "
+             "oid=? LIMIT 1;"),
+            (counterparty, oid))
+        return self.db.fetchone() is not None
+
+    def _has_active_fidelitybond_source_locked(self, counterparty):
+        self.db.execute(
+            ("SELECT 1 FROM fidelitybond_sources WHERE counterparty=? AND "
+             "active=1 LIMIT 1;"),
+            (counterparty,))
+        return self.db.fetchone() is not None
+
+    def _has_any_fidelitybond_source_locked(self, counterparty):
+        self.db.execute(
+            ("SELECT 1 FROM fidelitybond_sources WHERE counterparty=? "
+             "LIMIT 1;"),
+            (counterparty,))
+        return self.db.fetchone() is not None
+
+    def _latest_order_source_inactive_at_locked(self, counterparty, oid):
+        self.db.execute(
+            ("SELECT MAX(COALESCE(inactive_at, last_seen_at, first_seen_at, 0)) "
+             "AS inactive_at FROM orderbook_sources WHERE counterparty=? "
+             "AND oid=?;"),
             (counterparty, oid))
         row = self.db.fetchone()
-        if not row:
+        return row["inactive_at"] if row else None
+
+    def _latest_fidelitybond_source_inactive_at_locked(self, counterparty):
+        self.db.execute(
+            ("SELECT MAX(COALESCE(inactive_at, last_seen_at, first_seen_at, 0)) "
+             "AS inactive_at FROM fidelitybond_sources WHERE counterparty=?;"),
+            (counterparty,))
+        row = self.db.fetchone()
+        return row["inactive_at"] if row else None
+
+    @staticmethod
+    def _should_prune_inactive(now, inactive_at, grace_seconds):
+        if grace_seconds < 0:
+            return True
+        if inactive_at is None:
+            return grace_seconds == 0
+        return now - int(inactive_at) >= grace_seconds
+
+    def _prune_order_if_no_active_source_locked(self, counterparty, oid, now,
+                                                grace_seconds):
+        if not self._has_any_order_source_locked(counterparty, oid):
+            return
+        if self._has_active_order_source_locked(counterparty, oid):
+            return
+        inactive_at = self._latest_order_source_inactive_at_locked(
+            counterparty, oid)
+        if self._should_prune_inactive(now, inactive_at, grace_seconds):
+            self.db.execute(
+                ("DELETE FROM orderbook WHERE counterparty=? AND oid=?;"),
+                (counterparty, oid))
+
+    def _prune_fidelitybond_if_no_active_source_locked(self, counterparty, now,
+                                                       grace_seconds):
+        if not self._has_any_fidelitybond_source_locked(counterparty):
+            return
+        if self._has_active_fidelitybond_source_locked(counterparty):
+            return
+        inactive_at = self._latest_fidelitybond_source_inactive_at_locked(
+            counterparty)
+        if self._should_prune_inactive(now, inactive_at, grace_seconds):
+            self.db.execute("DELETE FROM fidelitybonds WHERE counterparty=?;",
+                            (counterparty,))
+
+    def _delete_order_if_no_sources_locked(self, counterparty, oid):
+        self.db.execute(
+            ("SELECT 1 FROM orderbook_sources WHERE counterparty=? AND oid=? "
+             "LIMIT 1;"),
+            (counterparty, oid))
+        if self.db.fetchone() is None:
+            self.db.execute(
+                ("DELETE FROM orderbook WHERE counterparty=? AND oid=?;"),
+                (counterparty, oid))
+
+    def _delete_fidelitybond_if_no_sources_locked(self, counterparty):
+        self.db.execute(
+            ("SELECT 1 FROM fidelitybond_sources WHERE counterparty=? "
+             "LIMIT 1;"),
+            (counterparty,))
+        if self.db.fetchone() is None:
+            self.db.execute("DELETE FROM fidelitybonds WHERE counterparty=?;",
+                            (counterparty,))
+
+    def _prune_orphan_order_sources_locked(self, now, retention_seconds):
+        if retention_seconds < 0:
             return
         self.db.execute(
-            'INSERT INTO orderbook VALUES(?, ?, ?, ?, ?, ?, ?);',
-            (counterparty, oid, row["ordertype"], row["minsize"],
-             row["maxsize"], row["txfee"], row["cjfee"]))
+            ("DELETE FROM orderbook_sources WHERE NOT EXISTS ("
+             "SELECT 1 FROM orderbook WHERE "
+             "orderbook.counterparty=orderbook_sources.counterparty AND "
+             "orderbook.oid=orderbook_sources.oid) AND "
+             "(?=0 OR ? - COALESCE(inactive_at, last_seen_at, first_seen_at, 0)"
+             " >= ?);"),
+            (retention_seconds, now, retention_seconds))
+
+    def _prune_orphan_fidelitybond_sources_locked(self, now,
+                                                  retention_seconds):
+        if retention_seconds < 0:
+            return
+        self.db.execute(
+            ("DELETE FROM fidelitybond_sources WHERE NOT EXISTS ("
+             "SELECT 1 FROM fidelitybonds WHERE "
+             "fidelitybonds.counterparty="
+             "fidelitybond_sources.counterparty) AND "
+             "(?=0 OR ? - COALESCE(inactive_at, last_seen_at, first_seen_at, 0)"
+             " >= ?);"),
+            (retention_seconds, now, retention_seconds))
+
+    def _prune_sources_locked(self, now=None, inactive_grace_seconds=None,
+                              orphan_retention_seconds=None):
+        now = self._now() if now is None else now
+        inactive_grace_seconds = (
+            self.source_inactive_grace_seconds
+            if inactive_grace_seconds is None else inactive_grace_seconds)
+        orphan_retention_seconds = (
+            self.orphan_source_retention_seconds
+            if orphan_retention_seconds is None else orphan_retention_seconds)
+
+        self.db.execute("SELECT counterparty, oid FROM orderbook;")
+        for row in self.db.fetchall():
+            self._prune_order_if_no_active_source_locked(
+                row["counterparty"], row["oid"], now,
+                inactive_grace_seconds)
+
+        self.db.execute("SELECT counterparty FROM fidelitybonds;")
+        for row in self.db.fetchall():
+            self._prune_fidelitybond_if_no_active_source_locked(
+                row["counterparty"], now, inactive_grace_seconds)
+
+        self._prune_orphan_order_sources_locked(now, orphan_retention_seconds)
+        self._prune_orphan_fidelitybond_sources_locked(
+            now, orphan_retention_seconds)
+
+    def prune_sources(self, now=None, inactive_grace_seconds=None,
+                      orphan_retention_seconds=None):
+        try:
+            self.dblock.acquire(True)
+            self._prune_sources_locked(now, inactive_grace_seconds,
+                                       orphan_retention_seconds)
+        finally:
+            self.dblock.release()
+
+    def has_active_order_source(self, counterparty, oid):
+        try:
+            self.dblock.acquire(True)
+            return self._has_active_order_source_locked(counterparty, oid)
+        finally:
+            self.dblock.release()
+
+    def has_active_fidelitybond_source(self, counterparty):
+        try:
+            self.dblock.acquire(True)
+            return self._has_active_fidelitybond_source_locked(counterparty)
+        finally:
+            self.dblock.release()
+
+    def _restore_order_from_sources_locked(self, counterparty, oid):
+        # Compatibility no-op for older tests/call paths: source rows no longer
+        # carry payload, so the global table remains the payload owner.
+        self._prune_order_if_no_active_source_locked(
+            counterparty, oid, self._now(), self.source_inactive_grace_seconds)
+
+    def _restore_fidelitybond_from_sources_locked(self, counterparty):
+        # Compatibility no-op for older tests/call paths; see
+        # _restore_order_from_sources_locked.
+        self._prune_fidelitybond_if_no_active_source_locked(
+            counterparty, self._now(), self.source_inactive_grace_seconds)
 
     def _upsert_fidelitybond_source_locked(self, counterparty, directory,
-                                           taker_nick, proof, now):
+                                           now):
         self.db.execute(
             ("SELECT first_seen_at FROM fidelitybond_sources WHERE "
              "counterparty=? AND directory=?;"),
@@ -234,56 +416,31 @@ class OrderbookWatch(object):
         first_seen_at = row["first_seen_at"] if row else now
         self.db.execute(
             ("INSERT OR REPLACE INTO fidelitybond_sources VALUES"
-             "(?, ?, ?, ?, ?, ?, ?, ?);"),
-            (counterparty, directory, taker_nick, proof, self._proof_hash(proof),
-             first_seen_at, now, self.current_refresh_id))
-
-    def _restore_fidelitybond_from_sources_locked(self, counterparty):
-        self.db.execute("DELETE FROM fidelitybonds WHERE counterparty=?;",
-                        (counterparty,))
-        self.db.execute(
-            ("SELECT takernick, proof FROM fidelitybond_sources WHERE "
-             "counterparty=? ORDER BY last_seen_at DESC LIMIT 1;"),
-            (counterparty,))
-        row = self.db.fetchone()
-        if not row:
-            return
-        self.db.execute("INSERT INTO fidelitybonds VALUES(?, ?, ?);",
-                        (counterparty, row["takernick"], row["proof"]))
+             "(?, ?, ?, ?, ?, ?, ?);"),
+            (counterparty, directory, first_seen_at, now,
+             self.current_refresh_id, 1, None))
 
     def prune_unseen_sources_for_directories(self, directories, refresh_id):
         directories = [d for d in directories if d]
         if not directories:
             return
+        now = self._now()
         try:
             self.dblock.acquire(True)
             for directory in directories:
                 self.db.execute(
-                    ("SELECT counterparty, oid FROM orderbook_sources WHERE "
-                     "directory=? AND "
+                    ("UPDATE orderbook_sources SET active=0, "
+                     "inactive_at=COALESCE(inactive_at, ?) "
+                     "WHERE directory=? AND active=1 AND "
                      "(last_refresh_id IS NULL OR last_refresh_id != ?);"),
-                    (directory, refresh_id))
-                stale_orders = [(r["counterparty"], r["oid"])
-                                for r in self.db.fetchall()]
+                    (now, directory, refresh_id))
                 self.db.execute(
-                    ("DELETE FROM orderbook_sources WHERE directory=? AND "
+                    ("UPDATE fidelitybond_sources SET active=0, "
+                     "inactive_at=COALESCE(inactive_at, ?) "
+                     "WHERE directory=? AND active=1 AND "
                      "(last_refresh_id IS NULL OR last_refresh_id != ?);"),
-                    (directory, refresh_id))
-                for counterparty, oid in stale_orders:
-                    self._restore_order_from_sources_locked(counterparty, oid)
-
-                self.db.execute(
-                    ("SELECT counterparty FROM fidelitybond_sources WHERE "
-                     "directory=? AND "
-                     "(last_refresh_id IS NULL OR last_refresh_id != ?);"),
-                    (directory, refresh_id))
-                stale_bonds = [r["counterparty"] for r in self.db.fetchall()]
-                self.db.execute(
-                    ("DELETE FROM fidelitybond_sources WHERE directory=? AND "
-                     "(last_refresh_id IS NULL OR last_refresh_id != ?);"),
-                    (directory, refresh_id))
-                for counterparty in stale_bonds:
-                    self._restore_fidelitybond_from_sources_locked(counterparty)
+                    (now, directory, refresh_id))
+            self._prune_sources_locked(now)
         finally:
             self.dblock.release()
 
@@ -340,18 +497,21 @@ class OrderbookWatch(object):
                 log.debug("Got invalid order ID: " + oid + " from " +
                           counterparty)
                 return
+            now = self._now()
             # delete orders eagerly, so in case a buggy maker sends an
             # invalid offer, we won't accidentally !fill based on the ghost
             # of its previous message.
-            self.db.execute(
-                ("DELETE FROM orderbook WHERE counterparty=? "
-                 "AND oid=?;"), (counterparty, oid))
             if source_directory:
+                self._deactivate_order_source_locked(
+                    counterparty, oid, source_directory, now)
+                self._prune_order_if_no_active_source_locked(
+                    counterparty, oid, now, self.source_inactive_grace_seconds)
+                self._prune_orphan_order_sources_locked(
+                    now, self.orphan_source_retention_seconds)
+            else:
                 self.db.execute(
-                    ("DELETE FROM orderbook_sources WHERE counterparty=? "
-                     "AND oid=? AND directory=?;"),
-                    (counterparty, oid, source_directory))
-                self._restore_order_from_sources_locked(counterparty, oid)
+                    ("DELETE FROM orderbook WHERE counterparty=? "
+                     "AND oid=?;"), (counterparty, oid))
             # now validate the remaining fields
             if int(minsize) < 0 or int(minsize) > 21 * 10**14:
                 log.debug("Got invalid minsize: {} from {}".format(
@@ -386,11 +546,9 @@ class OrderbookWatch(object):
                     return
             cjfee = str(Decimal(cjfee))
             if source_directory:
-                now = self._now()
                 self._record_directory_response_locked(source_directory, now)
                 self._upsert_order_source_locked(
-                    counterparty, oid, source_directory, ordertype, minsize,
-                    maxsize, txfee, cjfee, now)
+                    counterparty, oid, source_directory, now)
             self.db.execute(
                 ("DELETE FROM orderbook WHERE counterparty=? "
                  "AND oid=?;"), (counterparty, oid))
@@ -410,11 +568,10 @@ class OrderbookWatch(object):
         try:
             self.dblock.acquire(True)
             if source_directory:
-                self.db.execute(
-                    ("DELETE FROM orderbook_sources WHERE counterparty=? "
-                     "AND oid=? AND directory=?;"),
-                    (counterparty, oid, source_directory))
-                self._restore_order_from_sources_locked(counterparty, oid)
+                now = self._now()
+                self._deactivate_order_source_locked(
+                    counterparty, oid, source_directory, now)
+                self._prune_sources_locked(now)
                 return
             self.db.execute(
                 ("DELETE FROM orderbook_sources WHERE counterparty=? "
@@ -439,8 +596,7 @@ class OrderbookWatch(object):
                 now = self._now()
                 self._record_directory_response_locked(source_directory, now)
                 self._upsert_fidelitybond_source_locked(
-                    nick, source_directory, taker_nick,
-                    fidelity_bond_proof_msg, now)
+                    nick, source_directory, now)
             self.db.execute("DELETE FROM fidelitybonds WHERE counterparty=?;",
                             (nick, ))
             self.db.execute("INSERT INTO fidelitybonds VALUES(?, ?, ?);",
@@ -452,19 +608,18 @@ class OrderbookWatch(object):
         try:
             self.dblock.acquire(True)
             if source_directory:
+                now = self._now()
                 self.db.execute(
-                    ("SELECT oid FROM orderbook_sources WHERE counterparty=? "
-                     "AND directory=?;"), (nick, source_directory))
-                oids = [r["oid"] for r in self.db.fetchall()]
+                    ("UPDATE orderbook_sources SET active=0, "
+                     "inactive_at=COALESCE(inactive_at, ?) "
+                     "WHERE counterparty=? AND directory=? AND active=1;"),
+                    (now, nick, source_directory))
                 self.db.execute(
-                    ("DELETE FROM orderbook_sources WHERE counterparty=? "
-                     "AND directory=?;"), (nick, source_directory))
-                for oid in oids:
-                    self._restore_order_from_sources_locked(nick, oid)
-                self.db.execute(
-                    ("DELETE FROM fidelitybond_sources WHERE counterparty=? "
-                     "AND directory=?;"), (nick, source_directory))
-                self._restore_fidelitybond_from_sources_locked(nick)
+                    ("UPDATE fidelitybond_sources SET active=0, "
+                     "inactive_at=COALESCE(inactive_at, ?) "
+                     "WHERE counterparty=? AND directory=? AND active=1;"),
+                    (now, nick, source_directory))
+                self._prune_sources_locked(now)
                 return
             self.db.execute('DELETE FROM orderbook_sources WHERE '
                             'counterparty=?;', (nick,))

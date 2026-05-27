@@ -239,6 +239,14 @@ class MessageChannelCollection(object):
             sent = mc.pubmsg_to_directory(directory_location, msg) or sent
         return sent
 
+    def announce_orders_to_directory(self, directory_location, orderlist):
+        orderlines = self._make_orderlines(orderlist)
+        sent = False
+        for mc in self.available_channels():
+            sent = mc.announce_orders_to_directory(
+                directory_location, orderlines) or sent
+        return sent
+
     #END PUBLIC/BROADCAST SECTION
 
     def get_encryption_box(self, cmd, nick):
@@ -319,6 +327,14 @@ class MessageChannelCollection(object):
                           "; cannot find on any message channel.")
             return
 
+    @staticmethod
+    def _make_orderlines(orderlist):
+        order_keys = ['oid', 'minsize', 'maxsize', 'txfee', 'cjfee']
+        return [
+            COMMAND_PREFIX + order['ordertype'] + ' ' +
+            ' '.join([str(order[k]) for k in order_keys])
+            for order in orderlist]
+
     def announce_orders(self, orderlist, nick, fidelity_bond_proof_msg, new_mc):
         """Send orders defined in list orderlist either
         to the shared public channel (pit), on all
@@ -327,11 +343,7 @@ class MessageChannelCollection(object):
         privmsg, on a specific mc.
         Fidelity bonds can only be announced over privmsg, nick must be nonNone
         """
-        order_keys = ['oid', 'minsize', 'maxsize', 'txfee', 'cjfee']
-        orderlines = []
-        for order in orderlist:
-            orderlines.append(COMMAND_PREFIX + order['ordertype'] + \
-                    ' ' + ' '.join([str(order[k]) for k in order_keys]))
+        orderlines = self._make_orderlines(orderlist)
         if new_mc is not None and new_mc not in self.available_channels():
             log.info(
                 "Tried to announce orders on an unavailable message channel.")
@@ -919,6 +931,13 @@ class MessageChannel(object):
 
     def pubmsg_to_directory(self, directory_location, msg):
         return False
+
+    def announce_orders_to_directory(self, directory_location, orderlines):
+        sent = False
+        for orderline in orderlines:
+            sent = self.pubmsg_to_directory(directory_location, orderline) or \
+                sent
+        return sent
 
     # Taker callbacks
     def fill_orders(self, nick_order_dict, cj_amount, taker_pubkey, commitment):

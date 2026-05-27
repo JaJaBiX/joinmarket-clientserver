@@ -198,6 +198,9 @@ def test_setup_mc():
     mcc.prepare_privmsg(cp1, "auth", "a b c")
     #try announcing orders; first public
     mcc.announce_orders(t_orderbook, nick=None, fidelity_bond_proof_msg=None, new_mc=None)
+    assert mcc.announce_orders_to_directory("dn.onion:5222", t_orderbook)
+    assert dmcs[0].directory_pubmsgs[0][0] == "dn.onion:5222"
+    assert dmcs[0].directory_pubmsgs[0][1].startswith("!")
     #try on fake mc
     mcc.announce_orders(t_orderbook, nick=None, fidelity_bond_proof_msg=None, new_mc="fakemc")
     #direct to one cp

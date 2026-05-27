@@ -109,14 +109,21 @@ def test_order_sources_are_pruned_per_directory():
     source_rows = ob.db.execute(
         'SELECT * FROM orderbook_sources;').fetchall()
     assert len(source_rows) == 2
+    assert "ordertype" not in source_rows[0]
+    assert "offer_hash" not in source_rows[0]
+    assert set([r["active"] for r in source_rows]) == {1}
 
     ob.on_order_cancel("J5SourceMaker", "0", "dn1.onion:5222")
     rows = ob.db.execute('SELECT * FROM orderbook;').fetchall()
     assert len(rows) == 1
     source_rows = ob.db.execute(
-        'SELECT * FROM orderbook_sources;').fetchall()
-    assert len(source_rows) == 1
-    assert source_rows[0]["directory"] == "dn2.onion:5222"
+        'SELECT * FROM orderbook_sources ORDER BY directory;').fetchall()
+    assert len(source_rows) == 2
+    assert source_rows[0]["directory"] == "dn1.onion:5222"
+    assert source_rows[0]["active"] == 0
+    assert source_rows[0]["inactive_at"] is not None
+    assert source_rows[1]["directory"] == "dn2.onion:5222"
+    assert source_rows[1]["active"] == 1
 
     ob.set_current_refresh_id("refresh-1")
     ob.on_order_seen(*offer, source_directory="dn2.onion:5222")
@@ -143,6 +150,8 @@ def test_directory_message_metadata_tracks_relayed_orderbook_requests():
     assert row["last_orderbook_request_at"] is None
     assert row["last_orderbook_response_at"] is None
     assert row["rx_message_count"] == 1
+    assert row["orderbook_request_rx_count"] == 1
+    assert row["last_non_orderbook_message_at"] is None
 
     ob.msgchan.on_pubmsg("J5Requester", "!hp2 deadbeef",
                          source_directory=directory)
@@ -152,6 +161,8 @@ def test_directory_message_metadata_tracks_relayed_orderbook_requests():
         'SELECT * FROM directory_peers WHERE directory=?;',
         (directory,)).fetchone()
     assert row["rx_message_count"] == 3
+    assert row["orderbook_request_rx_count"] == 1
+    assert row["last_non_orderbook_message_at"] is not None
 
 def test_disconnect_leave():
     ob = get_ob()
