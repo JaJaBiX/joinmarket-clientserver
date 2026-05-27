@@ -919,12 +919,9 @@ class ObBasic(OrderbookWatch):
                 'SELECT * FROM orderbook_sources;').fetchall()]
             fidelitybond_sources = [dict(row) for row in self.db.execute(
                 'SELECT * FROM fidelitybond_sources;').fetchall()]
-            directory_peers = [dict(row) for row in self.db.execute(
-                'SELECT * FROM directory_peers;').fetchall()]
         return {'orderbook': orderbook, 'fidelitybonds': fidelitybonds,
                 'orderbook_sources': orderbook_sources,
-                'fidelitybond_sources': fidelitybond_sources,
-                'directory_peers': directory_peers}
+                'fidelitybond_sources': fidelitybond_sources}
 
     def restore_orderbook_snapshot(self, snapshot):
         def insert_rows(table, rows):
@@ -943,13 +940,11 @@ class ObBasic(OrderbookWatch):
             self.db.execute('DELETE FROM fidelitybonds;')
             self.db.execute('DELETE FROM orderbook_sources;')
             self.db.execute('DELETE FROM fidelitybond_sources;')
-            self.db.execute('DELETE FROM directory_peers;')
             insert_rows('orderbook', snapshot['orderbook'])
             insert_rows('fidelitybonds', snapshot['fidelitybonds'])
             insert_rows('orderbook_sources', snapshot['orderbook_sources'])
             insert_rows('fidelitybond_sources',
                         snapshot['fidelitybond_sources'])
-            insert_rows('directory_peers', snapshot['directory_peers'])
 
     def get_connected_directory_locations(self):
         channels = getattr(self.msgchan, 'mchannels', [self.msgchan])
