@@ -601,12 +601,15 @@ class OnionPeer(object):
             self.tcp_connector = reactor.connectTCP(self.hostname, self.port,
                                                     self.factory)
         else:
+            connect_timeout = getattr(
+                self.messagechannel, "onion_connect_timeout_seconds",
+                CONNECT_TO_ONION_TIMEOUT)
             # non-default timeout; needs to be much lower than our
             # 'wait at least a minute for the IRC connections to come up',
             # which is used for *all* message channels, together.
             torEndpoint = TCP4ClientEndpoint(reactor, self.socks5_host,
                                              self.socks5_port,
-                                             timeout=CONNECT_TO_ONION_TIMEOUT)
+                                             timeout=connect_timeout)
             onionEndpoint = TorSocksEndpoint(torEndpoint, self.hostname,
                                              self.port)
             self.reconnecting_service = ClientService(onionEndpoint, self.factory)
@@ -838,8 +841,13 @@ class OnionMessageChannel(MessageChannel):
         # the client, to decide whether to set up our connections
         # over localhost (if testing), without Tor:
         set_testing_mode(configdata)
-        self.directory_reconnect_initial_delay = \
-            ONION_DIRECTORY_RECONNECT_INITIAL_DELAY
+        self.onion_connect_timeout_seconds = get_float_env(
+            "JM_ONION_CONNECT_TIMEOUT_SECONDS",
+            CONNECT_TO_ONION_TIMEOUT,
+            minimum=1.0)
+        self.directory_reconnect_initial_delay = get_float_env(
+            "JM_ONION_RECONNECT_INITIAL_DELAY_SECONDS",
+            ONION_DIRECTORY_RECONNECT_INITIAL_DELAY)
         self.directory_reconnect_max_delay = get_float_env(
             "JM_ONION_RECONNECT_MAX_DELAY_SECONDS",
             ONION_DIRECTORY_RECONNECT_MAX_DELAY,
@@ -1755,7 +1763,8 @@ class OnionMessageChannel(MessageChannel):
             self.directory_wait_counter += 1
             # Keep trying until the timeout.
             # Note RHS need not be an integer.
-            if self.directory_wait_counter < CONNECT_TO_ONION_TIMEOUT/2 + 1:
+            if self.directory_wait_counter < \
+                    self.onion_connect_timeout_seconds / 2 + 1:
                 return
         if len(self.get_connected_directory_peers()) == 0:
             # at least one handshake must have succeeded, for us
