@@ -25,7 +25,9 @@ from jmclient import (
     SegwitWallet,
     storage,
 )
-from jmclient.wallet_rpc import api_version_string, CJ_MAKER_RUNNING, CJ_NOT_RUNNING
+from jmclient.wallet_rpc import (
+    api_version_string, CJ_MAKER_RUNNING, CJ_TAKER_RUNNING, CJ_NOT_RUNNING)
+import jmclient.wallet_rpc as wallet_rpc
 from commontest import make_wallets
 from test_coinjoin import make_wallets_to_list, sync_wallets
 
@@ -44,6 +46,98 @@ class JMWalletDaemonT(JMWalletDaemon):
         if self.auth_disabled:
             return True
         return super().check_cookie(request, *args, **kwargs)
+
+
+class DummyWSSFactory(object):
+    def __init__(self):
+        self.status_updates = []
+
+    def sendCoinjoinStatusUpdate(self, state):
+        self.status_updates.append(state)
+
+
+class DummyDelayedCall(object):
+    def __init__(self):
+        self.cancelled = False
+
+    def active(self):
+        return not self.cancelled
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class DummyStage2Taker(object):
+    attempt_id = "rpc-cj-test"
+    aborted = False
+    txid = None
+    nonrespondants = ["maker2"]
+    stage2_expected_makers = ["maker1", "maker2"]
+    stage2_valid_sig_makers = ["maker1"]
+
+
+def make_stage2_test_daemon():
+    load_test_config()
+    daemon = JMWalletDaemonT(0, 0, tls=False)
+    daemon.auth_disabled = True
+    daemon.wss_factory = DummyWSSFactory()
+    return daemon
+
+
+def test_stage2_watchdog_schedules_and_cancels(monkeypatch):
+    daemon = make_stage2_test_daemon()
+    taker = DummyStage2Taker()
+    taker.nonrespondants = ["maker1"]
+    taker.stage2_expected_makers = ["maker1"]
+    taker.stage2_valid_sig_makers = []
+    daemon.taker = taker
+    calls = []
+
+    def fake_call_later(delay, callback, *args):
+        call = DummyDelayedCall()
+        calls.append((delay, callback, args, call))
+        return call
+
+    monkeypatch.setattr(wallet_rpc.reactor, "callLater", fake_call_later)
+
+    daemon.on_taker_stage2_started(taker)
+
+    assert calls
+    assert calls[0][0] == 60
+    assert calls[0][1] == daemon.on_taker_stage2_timeout
+    assert calls[0][2] == ("rpc-cj-test",)
+    assert daemon.taker_stage2_timeout_call is calls[0][3]
+
+    daemon.on_taker_stage2_completed(taker)
+
+    assert calls[0][3].cancelled
+    assert daemon.taker_stage2_timeout_call is None
+    assert daemon.taker_stage2_timeout_attempt_id is None
+
+
+def test_stage2_watchdog_timeout_fails_and_cools_down():
+    daemon = make_stage2_test_daemon()
+    taker = DummyStage2Taker()
+    daemon.taker = taker
+    daemon.coinjoin_state = CJ_TAKER_RUNNING
+
+    daemon.on_taker_stage2_timeout("rpc-cj-test")
+
+    assert taker.aborted is True
+    assert daemon.taker is None
+    assert daemon.coinjoin_state == CJ_NOT_RUNNING
+    assert "maker2" in daemon.stage2_maker_cooldowns
+    assert daemon.wss_factory.status_updates[-1] == CJ_NOT_RUNNING
+
+
+def test_stage2_cooldown_prunes_expired_makers():
+    daemon = make_stage2_test_daemon()
+    daemon.stage2_maker_cooldowns = {
+        "expired": 9,
+        "active": 11,
+    }
+
+    assert daemon.get_active_stage2_maker_cooldowns(now=10) == ["active"]
 
 class WalletRPCTestBase(object):
     """ Base class for set up of tests of the

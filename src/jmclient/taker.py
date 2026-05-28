@@ -3,6 +3,7 @@
 import base64
 import pprint
 import random
+import time
 from typing import Any, NamedTuple, Optional
 from twisted.internet import reactor, task
 
@@ -53,7 +54,10 @@ class Taker(object):
                  tdestaddrs=None,
                  custom_change_address=None,
                  change_label=None,
-                 ignored_makers=None):
+                 ignored_makers=None,
+                 attempt_id=None,
+                 stage2_start_callback=None,
+                 stage2_complete_callback=None):
         """`schedule`` must be a list of tuples: (see sample_schedule_for_testnet
         for explanation of syntax, also schedule.py module in this directory),
         which will be a sequence of joins to do.
@@ -136,9 +140,31 @@ class Taker(object):
         if not self.taker_info_callback:
             self.taker_info_callback = self.default_taker_info_callback
         self.on_finished_callback = callbacks[2]
+        self.attempt_id = attempt_id
+        self.stage2_expected_makers = []
+        self.stage2_valid_sig_makers = []
+        self.stage2_tx_sent_at = None
+        self.stage2_start_callback = stage2_start_callback
+        self.stage2_complete_callback = stage2_complete_callback
 
     def default_taker_info_callback(self, infotype, msg):
         jlog.info(infotype + ":" + msg)
+
+    def _format_maker_list(self, makers):
+        return "[" + ",".join(sorted([str(maker) for maker in makers])) + "]"
+
+    def _log_attempt(self, msg):
+        if self.attempt_id:
+            jlog.info(f"taker_attempt attempt_id={self.attempt_id} {msg}")
+
+    def _call_stage2_callback(self, callback_name):
+        callback = getattr(self, callback_name)
+        if not callback:
+            return
+        try:
+            callback(self)
+        except Exception as e:
+            jlog.warn(f"{callback_name} failed: {repr(e)}")
 
     def add_ignored_makers(self, makers):
         """Makers should be added to this list when they have refused to
@@ -296,6 +322,9 @@ class Taker(object):
                 #for some reason; no action is taken, we let the stallMonitor
                 # + the finished callback decide whether to retry.
                 return False
+            self._log_attempt(
+                "selected_makers=" +
+                self._format_maker_list(list(self.orderbook.keys())))
             if self.filter_orders_callback:
                 accepted = self.filter_orders_callback([self.orderbook,
                                                         self.total_cj_fee],
@@ -386,6 +415,9 @@ class Taker(object):
                 self.taker_info_callback("ABORT",
                                 "Could not find orders to complete transaction")
                 return False
+            self._log_attempt(
+                "selected_makers=" +
+                self._format_maker_list(list(self.orderbook.keys())))
             if self.filter_orders_callback:
                 if not self.filter_orders_callback((self.orderbook,
                                                     self.total_cj_fee),
@@ -405,6 +437,7 @@ class Taker(object):
             return (False, "User aborted")
 
         self.maker_utxo_data = {}
+        stage1_expected = list(self.nonrespondants)
 
         verified_data = self._verify_ioauth_data(ioauth_data)
         for maker_inputs in verified_data:
@@ -432,6 +465,15 @@ class Taker(object):
                     "Failure to remove counterparty from nonrespondants list:"
                     f" {maker_inputs.nick}), error message: {repr(e)})")
 
+        stage1_responded = list(self.maker_utxo_data.keys())
+        stage1_missing = list(self.nonrespondants)
+        self._log_attempt(
+            "stage1_expected=" + self._format_maker_list(stage1_expected))
+        self._log_attempt(
+            "stage1_responded=" + self._format_maker_list(stage1_responded))
+        self._log_attempt(
+            "stage1_missing=" + self._format_maker_list(stage1_missing))
+
         #Apply business logic of how many counterparties are enough; note that
         #this must occur after the above ioauth data processing, since we only now
         #know for sure that the data meets all business-logic requirements.
@@ -446,6 +488,8 @@ class Taker(object):
         #The list self.nonrespondants is now reset and
         #used to track return of signatures for phase 2
         self.nonrespondants = list(self.maker_utxo_data.keys())
+        self.stage2_expected_makers = list(self.nonrespondants)
+        self.stage2_valid_sig_makers = []
 
         my_total_in = sum([va['value'] for u, va in self.input_utxos.items()])
         if self.my_change_addr:
@@ -533,6 +577,11 @@ class Taker(object):
             self.latest_tx))
 
         self.taker_info_callback("INFO", "Built tx, sending to counterparties.")
+        self.stage2_tx_sent_at = time.time()
+        self._log_attempt(
+            "stage2_tx_sent expected_signers=" +
+            self._format_maker_list(self.stage2_expected_makers))
+        self._call_stage2_callback("stage2_start_callback")
         return (True, list(self.maker_utxo_data.keys()),
                 self.latest_tx.serialize())
 
@@ -645,6 +694,7 @@ class Taker(object):
             jlog.debug(('add_signature => nick={} '
                        'not in nonrespondants {}').format(nick, self.nonrespondants))
             return False
+        self._log_attempt(f"sig_received nick={nick}")
         sig = base64.b64decode(sigb64)
         inserted_sig = False
 
@@ -730,6 +780,8 @@ class Taker(object):
                     self.utxos[nick].remove(u[1])
                 except ValueError:
                     pass
+                if nick not in self.stage2_valid_sig_makers:
+                    self.stage2_valid_sig_makers.append(nick)
                 if len(self.utxos[nick]) == 0:
                     jlog.debug(('nick = {} sent all sigs, removing from '
                                'nonrespondant list').format(nick))
@@ -737,6 +789,9 @@ class Taker(object):
                         self.nonrespondants.remove(nick)
                     except ValueError:
                         pass
+                self._log_attempt(
+                    f"sig_valid nick={nick} remaining=" +
+                    self._format_maker_list(self.nonrespondants))
                 break
         if not inserted_sig:
             jlog.debug('signature did not match anything in the tx')
@@ -754,6 +809,10 @@ class Taker(object):
             return False
         assert not len(self.nonrespondants)
         jlog.info('all makers have sent their signatures')
+        self._log_attempt(
+            "stage2_complete signers=" +
+            self._format_maker_list(self.stage2_expected_makers))
+        self._call_stage2_callback("stage2_complete_callback")
         self.taker_info_callback("INFO", "Transaction is valid, signing..")
         jlog.debug("schedule item was: " + str(self.schedule[self.schedule_index]))
         return self.self_sign_and_push()

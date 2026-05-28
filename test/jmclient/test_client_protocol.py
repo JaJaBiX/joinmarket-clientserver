@@ -21,6 +21,7 @@ import json
 import jmbitcoin as bitcoin
 import twisted
 import base64
+import jmclient.client_protocol as client_protocol
 
 import pytest
 
@@ -86,6 +87,56 @@ class DummyTaker(Taker):
 class DummyWallet(object):
     def get_wallet_id(self):
         return 'aaaa'
+
+
+class DummyDeferred(object):
+    def addCallback(self, callback):
+        return self
+
+    def addErrback(self, errback):
+        return self
+
+
+class DummyFactoryForStallMonitor(object):
+    def get_mchannels(self, mode):
+        return []
+
+
+class DummyProtocolForStallMonitor(JMTakerClientProtocol):
+    def __init__(self, client):
+        self.client = client
+        self.factory = DummyFactoryForStallMonitor()
+
+    def callRemote(self, *args, **kwargs):
+        return DummyDeferred()
+
+    def defaultCallbacks(self, d):
+        return None
+
+
+def test_client_start_uses_explicit_stall_monitor_timeout(monkeypatch):
+    load_test_config()
+    jm_single().maker_timeout_sec = 15
+    jm_single().taker_stall_monitor_timeout_seconds = 60
+    calls = []
+
+    def fake_call_later(delay, callback, *args):
+        calls.append((delay, callback, args))
+        return object()
+
+    monkeypatch.setattr(client_protocol.reactor, "callLater", fake_call_later)
+    client = type("DummyTakerForStall", (), {
+        "aborted": False,
+        "schedule_index": 2,
+    })()
+    proto = DummyProtocolForStallMonitor(client)
+
+    proto.clientStart()
+
+    assert calls
+    assert calls[0][0] == 60
+    assert calls[0][1] == proto.stallMonitor
+    assert calls[0][2] == (3,)
 
 #class DummyWalletService(object):
 #    wallet = DummyWallet()

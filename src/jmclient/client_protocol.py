@@ -604,11 +604,11 @@ class JMTakerClientProtocol(JMClientProtocol):
         chan_configs = self.factory.get_mchannels(mode="TAKER")
         minmakers = jm_single().config.getint("POLICY", "minimum_makers")
         maker_timeout_sec = jm_single().maker_timeout_sec
+        taker_stall_monitor_timeout = \
+            jm_single().taker_stall_monitor_timeout_seconds
 
-        #To avoid creating yet another config variable, we set the timeout
-        #to 20 * maker_timeout_sec.
         if not hasattr(self.client, 'testflag'): #pragma: no cover
-            reactor.callLater(20*maker_timeout_sec, self.stallMonitor,
+            reactor.callLater(taker_stall_monitor_timeout, self.stallMonitor,
                           self.client.schedule_index+1)
 
         d = self.callRemote(commands.JMInit,

@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import uuid
 from io import BytesIO
 from jmclient.wallet_utils import wallet_showutxos
 from twisted.internet import reactor, ssl
@@ -172,6 +174,7 @@ class JMWalletDaemon(Service):
         self.services["maker"] = None
         # our taker object will handle doing sends/taker-cjs:
         self.taker = None
+        self.clientfactory = None
         # the factory of type JmwalletdWebsocketServerFactory,
         # which has notification methods that can be passed
         # as callbacks for in-wallet events:
@@ -187,6 +190,9 @@ class JMWalletDaemon(Service):
         # a tumble schedule.
         self.tumbler_options = None
         self.tumble_log = None
+        self.taker_stage2_timeout_call = None
+        self.taker_stage2_timeout_attempt_id = None
+        self.stage2_maker_cooldowns = {}
         # save settings we might temporary change runtime
         self.default_policy_tx_fees = jm_single().config.get("POLICY",
                                                              "tx_fees")
@@ -225,6 +231,106 @@ class JMWalletDaemon(Service):
             return True
         # anything else is a conflict and we can't change:
         return False
+
+    def get_config_int(self, section, key, default):
+        try:
+            return jm_single().config.getint(section, key)
+        except Exception:
+            return default
+
+    def get_taker_stage2_sig_timeout_seconds(self):
+        return self.get_config_int(
+            "TIMEOUT", "taker_stage2_sig_timeout_seconds",
+            jm_single().taker_stage2_sig_timeout_seconds)
+
+    def get_taker_stage2_maker_cooldown_seconds(self):
+        return self.get_config_int(
+            "POLICY", "taker_stage2_maker_cooldown_seconds", 3600)
+
+    def make_taker_attempt_id(self):
+        return "rpc-cj-" + uuid.uuid4().hex[:12]
+
+    def cancel_taker_stage2_timeout(self):
+        if self.taker_stage2_timeout_call:
+            if self.taker_stage2_timeout_call.active():
+                self.taker_stage2_timeout_call.cancel()
+            self.taker_stage2_timeout_call = None
+        self.taker_stage2_timeout_attempt_id = None
+
+    def prune_stage2_maker_cooldowns(self, now=None):
+        if now is None:
+            now = time.time()
+        self.stage2_maker_cooldowns = {
+            maker: expires_at
+            for maker, expires_at in self.stage2_maker_cooldowns.items()
+            if expires_at > now
+        }
+
+    def get_active_stage2_maker_cooldowns(self, now=None):
+        self.prune_stage2_maker_cooldowns(now)
+        return sorted(self.stage2_maker_cooldowns.keys())
+
+    def add_stage2_maker_cooldowns(self, makers, now=None):
+        if now is None:
+            now = time.time()
+        cooldown_seconds = self.get_taker_stage2_maker_cooldown_seconds()
+        if cooldown_seconds <= 0 or not makers:
+            return
+        expires_at = now + cooldown_seconds
+        for maker in makers:
+            self.stage2_maker_cooldowns[maker] = expires_at
+        jlog.info("stage2_maker_cooldown added_makers=[{}] "
+                  "cooldown_seconds={}".format(
+                      ",".join(sorted(makers)), cooldown_seconds))
+
+    def on_taker_stage2_started(self, taker):
+        if taker is not self.taker:
+            return
+        if self.tumbler_options:
+            return
+        timeout = self.get_taker_stage2_sig_timeout_seconds()
+        self.cancel_taker_stage2_timeout()
+        if timeout <= 0:
+            jlog.info("taker_attempt attempt_id={} stage2_watchdog_disabled".
+                      format(taker.attempt_id))
+            return
+        self.taker_stage2_timeout_attempt_id = taker.attempt_id
+        self.taker_stage2_timeout_call = reactor.callLater(
+            timeout, self.on_taker_stage2_timeout, taker.attempt_id)
+        jlog.info("taker_attempt attempt_id={} stage2_watchdog_scheduled "
+                  "timeout_seconds={} expected=[{}]".format(
+                      taker.attempt_id, timeout,
+                      ",".join(sorted(taker.stage2_expected_makers))))
+
+    def on_taker_stage2_completed(self, taker):
+        if taker is not self.taker:
+            return
+        if taker.attempt_id != self.taker_stage2_timeout_attempt_id:
+            return
+        self.cancel_taker_stage2_timeout()
+
+    def on_taker_stage2_timeout(self, attempt_id):
+        self.taker_stage2_timeout_call = None
+        self.taker_stage2_timeout_attempt_id = None
+        if self.coinjoin_state != CJ_TAKER_RUNNING:
+            return
+        if not self.taker or self.taker.attempt_id != attempt_id:
+            return
+        if self.taker.aborted or self.taker.txid:
+            return
+        if not self.taker.nonrespondants:
+            return
+        expected = list(self.taker.stage2_expected_makers)
+        valid = list(self.taker.stage2_valid_sig_makers)
+        missing = list(self.taker.nonrespondants)
+        jlog.info("taker_attempt attempt_id={} stage2_timeout expected=[{}] "
+                  "valid=[{}] missing=[{}]".format(
+                      attempt_id, ",".join(sorted(expected)),
+                      ",".join(sorted(valid)),
+                      ",".join(sorted(missing))))
+        self.add_stage2_maker_cooldowns(missing)
+        self.taker.aborted = True
+        self.taker_finished(False)
 
     def startService(self):
         """ Encapsulates start up actions.
@@ -534,6 +640,7 @@ class JMWalletDaemon(Service):
                 reactor.callLater(waittime*60, self.clientfactory.getClient().clientStart)
 
     def stop_taker(self, res):
+        self.cancel_taker_stage2_timeout()
         self.taker = None
 
         if not res:
@@ -1348,14 +1455,26 @@ class JMWalletDaemon(Service):
                 jm_single().config.set("POLICY", "tx_fees",
                                        str(request_data["txfee"]))
 
+            attempt_id = self.make_taker_attempt_id()
+            ignored_makers = self.get_active_stage2_maker_cooldowns()
+            if ignored_makers:
+                jlog.info("taker_attempt attempt_id={} active_stage2_"
+                          "cooldowns=[{}]".format(
+                              attempt_id, ",".join(ignored_makers)))
+
             self.taker = Taker(self.services["wallet"], schedule,
                                max_cj_fee = max_cj_fee,
                                callbacks=(self.filter_orders_callback,
-                                          None, self.taker_finished))
-            # TODO ; this makes use of a pre-existing hack to allow
-            # selectively disabling the stallMonitor function that checks
-            # if transactions went through or not; here we want to cleanly
-            # destroy the Taker after an attempt is made, successful or not.
+                                          None, self.taker_finished),
+                               ignored_makers=ignored_makers,
+                               attempt_id=attempt_id,
+                               stage2_start_callback=(
+                                   self.on_taker_stage2_started),
+                               stage2_complete_callback=(
+                                   self.on_taker_stage2_completed))
+            # Keep the generic stallMonitor disabled for this RPC-only taker;
+            # stage-2 signature collection is covered by the RPC watchdog
+            # above and single-attempt cleanup is handled by taker_finished().
             self.taker.testflag = True
             self.clientfactory = self.get_client_factory()
 

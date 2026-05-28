@@ -633,6 +633,7 @@ def test_on_sig(setup_taker, dummyaddr, schedule):
     assert sig, "Failed to sign: " + msg
     sig3 = b64encode(tx2.vin[2].scriptSig)
     taker.on_sig("cp1", sig3)
+    assert taker.stage2_valid_sig_makers == ["cp1"]
     #try sending the same sig again; should be ignored
     taker.on_sig("cp1", sig3)
     sig, msg = bitcoin.sign(tx2, 3, privs[3])
@@ -641,6 +642,7 @@ def test_on_sig(setup_taker, dummyaddr, schedule):
     #try sending junk instead of cp2's correct sig
     assert not taker.on_sig("cp2", str("junk")), "incorrectly accepted junk signature"
     taker.on_sig("cp2", sig4)
+    assert taker.stage2_valid_sig_makers == ["cp1", "cp2"]
     sig, msg = bitcoin.sign(tx2, 4, privs[4])
     assert sig, "Failed to sign: " + msg
     #Before completing with the final signature, which will trigger our own
@@ -649,10 +651,12 @@ def test_on_sig(setup_taker, dummyaddr, schedule):
     dbci.setQUSFail(True)
     sig5 = b64encode(tx2.vin[4].scriptSig)
     assert not taker.on_sig("cp3", sig5), "incorrectly accepted sig5"
+    assert taker.stage2_valid_sig_makers == ["cp1", "cp2"]
     #allow it to succeed, and try again
     dbci.setQUSFail(False)
     #this should succeed and trigger the we-sign code
     taker.on_sig("cp3", sig5)
+    assert taker.stage2_valid_sig_makers == ["cp1", "cp2", "cp3"]
 
 @pytest.mark.parametrize(
     "schedule",

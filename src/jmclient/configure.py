@@ -69,7 +69,9 @@ global_singleton.nickname = None
 global_singleton.BITCOIN_DUST_THRESHOLD = btc.DUST_THRESHOLD
 global_singleton.DUST_THRESHOLD = 10 * global_singleton.BITCOIN_DUST_THRESHOLD
 global_singleton.bc_interface = None
-global_singleton.maker_timeout_sec = 60
+global_singleton.maker_timeout_sec = 15
+global_singleton.taker_stall_monitor_timeout_seconds = 60
+global_singleton.taker_stage2_sig_timeout_seconds = 60
 global_singleton.debug_file_handle = None
 global_singleton.core_alert = core_alert
 global_singleton.joinmarket_alert = joinmarket_alert
@@ -214,7 +216,9 @@ console_log_level = INFO
 color = true
 
 [TIMEOUT]
-maker_timeout_sec = 60
+maker_timeout_sec = 15
+taker_stall_monitor_timeout_seconds = 60
+taker_stage2_sig_timeout_seconds = 60
 unconfirm_timeout_sec = 180
 confirm_timeout_hours = 6
 
@@ -271,6 +275,7 @@ tx_fees_factor = 0.2
 # Example: N=350000 will use 350 thousand sats/kilo-vbyte (350 sats/vB) as a
 # maximum fee.
 absurd_fee_per_kb = 350000
+taker_stage2_maker_cooldown_seconds = 3600
 
 # In decimal, the maximum allowable change either lower or
 # higher, that the fee rate used for coinjoin sweeps is
@@ -735,6 +740,20 @@ def load_program_config(config_path: str = "", bs: Optional[str] = None,
     except NoOptionError: #pragma: no cover
         log.debug('TIMEOUT/maker_timeout_sec not found in .cfg file, '
                   'using default value')
+    try:
+        global_singleton.taker_stall_monitor_timeout_seconds = \
+            global_singleton.config.getint(
+                'TIMEOUT', 'taker_stall_monitor_timeout_seconds')
+    except NoOptionError: #pragma: no cover
+        log.debug('TIMEOUT/taker_stall_monitor_timeout_seconds not found '
+                  'in .cfg file, using default value')
+    try:
+        global_singleton.taker_stage2_sig_timeout_seconds = \
+            global_singleton.config.getint(
+                'TIMEOUT', 'taker_stage2_sig_timeout_seconds')
+    except NoOptionError: #pragma: no cover
+        log.debug('TIMEOUT/taker_stage2_sig_timeout_seconds not found '
+                  'in .cfg file, using default value')
 
     # configure the interface to the blockchain on startup
     global_singleton.bc_interface = get_blockchain_interface_instance(
