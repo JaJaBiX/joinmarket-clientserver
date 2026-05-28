@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from decimal import InvalidOperation, Decimal
 from numbers import Integral
 
@@ -45,13 +46,15 @@ class OrderbookWatch(object):
             self.db.execute("CREATE TABLE orderbook_sources("
                             "counterparty TEXT, oid INTEGER, directory TEXT, "
                             "first_seen_at INTEGER, last_seen_at INTEGER, "
-                            "last_refresh_id TEXT, active INTEGER DEFAULT 1, "
+                            "last_refresh_id TEXT NOT NULL, "
+                            "active INTEGER DEFAULT 1, "
                             "inactive_at INTEGER, "
                             "PRIMARY KEY(counterparty, oid, directory));")
             self.db.execute("CREATE TABLE fidelitybond_sources("
                             "counterparty TEXT, directory TEXT, "
                             "first_seen_at INTEGER, last_seen_at INTEGER, "
-                            "last_refresh_id TEXT, active INTEGER DEFAULT 1, "
+                            "last_refresh_id TEXT NOT NULL, "
+                            "active INTEGER DEFAULT 1, "
                             "inactive_at INTEGER, "
                             "PRIMARY KEY(counterparty, directory));")
             self.db.execute("CREATE TABLE directory_peers("
@@ -100,6 +103,10 @@ class OrderbookWatch(object):
     def set_current_refresh_id(self, refresh_id):
         self.current_refresh_id = refresh_id
 
+    @staticmethod
+    def _make_initial_refresh_id():
+        return "initial-" + uuid.uuid4().hex
+
     def _ensure_directory_peer_locked(self, directory):
         self.db.execute("SELECT directory FROM directory_peers WHERE "
                         "directory=?;", (directory,))
@@ -119,6 +126,20 @@ class OrderbookWatch(object):
         values = [fields[key] for key in keys] + [directory]
         self.db.execute("UPDATE directory_peers SET " + assignments +
                         " WHERE directory=?;", values)
+
+    def _get_or_create_directory_refresh_id_locked(self, directory):
+        self._ensure_directory_peer_locked(directory)
+        self.db.execute("SELECT last_refresh_id FROM directory_peers WHERE "
+                        "directory=?;", (directory,))
+        row = self.db.fetchone()
+        refresh_id = row["last_refresh_id"] if row else None
+        if refresh_id is None:
+            refresh_id = self._make_initial_refresh_id()
+            self.db.execute(
+                "UPDATE directory_peers SET last_refresh_id=? "
+                "WHERE directory=?;",
+                (refresh_id, directory))
+        return refresh_id
 
     def record_directory_connected(self, directory):
         now = self._now()
@@ -211,11 +232,10 @@ class OrderbookWatch(object):
     def _record_directory_response_locked(self, directory, now):
         fields = {"last_seen_at": now, "last_orderbook_response_at": now,
                   "status": "connected"}
-        if self.current_refresh_id is not None:
-            fields["last_refresh_id"] = self.current_refresh_id
         self._set_directory_peer_fields_locked(directory, **fields)
 
     def _upsert_order_source_locked(self, counterparty, oid, directory, now):
+        refresh_id = self._get_or_create_directory_refresh_id_locked(directory)
         self.db.execute(
             ("SELECT first_seen_at FROM orderbook_sources WHERE "
              "counterparty=? AND oid=? AND directory=?;"),
@@ -226,7 +246,7 @@ class OrderbookWatch(object):
             ("INSERT OR REPLACE INTO orderbook_sources VALUES"
              "(?, ?, ?, ?, ?, ?, ?, ?);"),
             (counterparty, oid, directory, first_seen_at, now,
-             self.current_refresh_id, 1, None))
+             refresh_id, 1, None))
 
     def _deactivate_order_source_locked(self, counterparty, oid, directory,
                                         now):
@@ -428,6 +448,7 @@ class OrderbookWatch(object):
 
     def _upsert_fidelitybond_source_locked(self, counterparty, directory,
                                            now):
+        refresh_id = self._get_or_create_directory_refresh_id_locked(directory)
         self.db.execute(
             ("SELECT first_seen_at FROM fidelitybond_sources WHERE "
              "counterparty=? AND directory=?;"),
@@ -438,7 +459,7 @@ class OrderbookWatch(object):
             ("INSERT OR REPLACE INTO fidelitybond_sources VALUES"
              "(?, ?, ?, ?, ?, ?, ?);"),
             (counterparty, directory, first_seen_at, now,
-             self.current_refresh_id, 1, None))
+             refresh_id, 1, None))
 
     def prune_unseen_sources_for_directories(self, directories, refresh_id):
         directories = [d for d in directories if d]
@@ -452,13 +473,13 @@ class OrderbookWatch(object):
                     ("UPDATE orderbook_sources SET active=0, "
                      "inactive_at=COALESCE(inactive_at, ?) "
                      "WHERE directory=? AND active=1 AND "
-                     "(last_refresh_id IS NULL OR last_refresh_id != ?);"),
+                     "last_refresh_id != ?;"),
                     (now, directory, refresh_id))
                 self.db.execute(
                     ("UPDATE fidelitybond_sources SET active=0, "
                      "inactive_at=COALESCE(inactive_at, ?) "
                      "WHERE directory=? AND active=1 AND "
-                     "(last_refresh_id IS NULL OR last_refresh_id != ?);"),
+                     "last_refresh_id != ?;"),
                     (now, directory, refresh_id))
             self._prune_sources_locked(now)
         finally:

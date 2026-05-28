@@ -125,15 +125,112 @@ def test_order_sources_are_pruned_per_directory():
     assert source_rows[1]["directory"] == "dn2.onion:5222"
     assert source_rows[1]["active"] == 1
 
-    ob.set_current_refresh_id("refresh-1")
+    ob.record_orderbook_request("dn2.onion:5222", "refresh-1")
     ob.on_order_seen(*offer, source_directory="dn2.onion:5222")
-    ob.set_current_refresh_id(None)
     ob.prune_unseen_sources_for_directories(["dn2.onion:5222"], "refresh-2")
     rows = ob.db.execute('SELECT * FROM orderbook;').fetchall()
     assert len(rows) == 0
     source_rows = ob.db.execute(
         'SELECT * FROM orderbook_sources;').fetchall()
     assert len(source_rows) == 0
+
+def test_late_order_reactivates_with_directory_refresh_generation():
+    ob = get_ob()
+    ob.source_inactive_grace_seconds = 3600
+    maker = "J5LateMaker"
+    directory = "dn-late.onion:5222"
+    offer = (maker, "0", "reloffer", "3000", "4000", "2", "0.3")
+
+    ob.record_orderbook_request(directory, "refresh-1")
+    ob.db.execute(
+        'INSERT INTO orderbook VALUES(?, ?, ?, ?, ?, ?, ?);',
+        (maker, "0", "reloffer", "3000", "4000", "2", "0.3"))
+    ob.db.execute(
+        'INSERT INTO orderbook_sources VALUES(?, ?, ?, ?, ?, ?, ?, ?);',
+        (maker, "0", directory, 1, 1, "refresh-0", 1, None))
+
+    ob.prune_unseen_sources_for_directories([directory], "refresh-1")
+    source_row = ob.db.execute(
+        'SELECT * FROM orderbook_sources WHERE counterparty=? AND oid=? '
+        'AND directory=?;',
+        (maker, "0", directory)).fetchone()
+    assert source_row["active"] == 0
+    assert len(ob.get_visible_orderbook_rows()) == 0
+
+    ob.on_order_seen(*offer, source_directory=directory)
+    source_row = ob.db.execute(
+        'SELECT * FROM orderbook_sources WHERE counterparty=? AND oid=? '
+        'AND directory=?;',
+        (maker, "0", directory)).fetchone()
+    assert source_row["active"] == 1
+    assert source_row["last_refresh_id"] == "refresh-1"
+    assert len(ob.get_visible_orderbook_rows()) == 1
+
+def test_late_order_source_does_not_get_null_refresh_id():
+    ob = get_ob()
+    maker = "J5LateNullMaker"
+    directory = "dn-late-null.onion:5222"
+    offer = (maker, "0", "reloffer", "3000", "4000", "2", "0.3")
+
+    ob.record_orderbook_request(directory, "refresh-1")
+    ob.set_current_refresh_id(None)
+    ob.on_order_seen(*offer, source_directory=directory)
+
+    source_row = ob.db.execute(
+        'SELECT * FROM orderbook_sources WHERE counterparty=? AND oid=? '
+        'AND directory=?;',
+        (maker, "0", directory)).fetchone()
+    assert source_row["last_refresh_id"] == "refresh-1"
+
+def test_source_from_other_directory_keeps_its_own_generation():
+    ob = get_ob()
+    directory_a = "dn-a.onion:5222"
+    directory_b = "dn-b.onion:5222"
+    maker = "J5DirectoryBMaker"
+    offer = (maker, "0", "reloffer", "3000", "4000", "2", "0.3")
+
+    ob.record_orderbook_request(directory_a, "refresh-a")
+    ob.record_orderbook_request(directory_b, "refresh-b")
+    ob.set_current_refresh_id("refresh-a")
+    ob.on_order_seen(*offer, source_directory=directory_b)
+
+    source_row = ob.db.execute(
+        'SELECT * FROM orderbook_sources WHERE counterparty=? AND oid=? '
+        'AND directory=?;',
+        (maker, "0", directory_b)).fetchone()
+    assert source_row["last_refresh_id"] == "refresh-b"
+
+def test_source_upserts_assign_initial_non_null_refresh_ids():
+    ob = get_ob()
+    directory = "dn-initial.onion:5222"
+    maker = "J5InitialMaker"
+    offer = (maker, "0", "reloffer", "3000", "4000", "2", "0.3")
+
+    ob.on_order_seen(*offer, source_directory=directory)
+    order_source_row = ob.db.execute(
+        'SELECT * FROM orderbook_sources WHERE counterparty=? AND oid=? '
+        'AND directory=?;',
+        (maker, "0", directory)).fetchone()
+    directory_row = ob.db.execute(
+        'SELECT * FROM directory_peers WHERE directory=?;',
+        (directory,)).fetchone()
+    assert order_source_row["last_refresh_id"] is not None
+    assert order_source_row["last_refresh_id"] == \
+        directory_row["last_refresh_id"]
+
+    try:
+        ob.dblock.acquire(True)
+        ob._upsert_fidelitybond_source_locked("J5InitialBond", directory,
+                                              ob._now())
+    finally:
+        ob.dblock.release()
+    fbond_source_row = ob.db.execute(
+        'SELECT * FROM fidelitybond_sources WHERE counterparty=? '
+        'AND directory=?;',
+        ("J5InitialBond", directory)).fetchone()
+    assert fbond_source_row["last_refresh_id"] is not None
+    assert fbond_source_row["last_refresh_id"] == \
+        directory_row["last_refresh_id"]
 
 def test_visible_orderbook_requires_active_connected_source():
     ob = get_ob()
