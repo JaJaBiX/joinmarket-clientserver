@@ -686,6 +686,9 @@ class JMTakerClientProtocol(JMClientProtocol):
         if not success:
             jlog.info("Makers who didnt respond: " + str(ioauth_data))
             self.client.add_ignored_makers(ioauth_data)
+            if len(self.client.schedule) == 1:
+                self.client.on_finished_callback(False, False, 0.0)
+                return {'accepted': False}
             return {'accepted': True}
         else:
             jlog.info("Makers responded with: " + str(ioauth_data))

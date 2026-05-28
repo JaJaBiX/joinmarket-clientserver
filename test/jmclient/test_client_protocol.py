@@ -138,6 +138,29 @@ def test_client_start_uses_explicit_stall_monitor_timeout(monkeypatch):
     assert calls[0][1] == proto.stallMonitor
     assert calls[0][2] == (3,)
 
+
+def test_single_join_fill_response_failure_finishes_immediately():
+    calls = []
+
+    class DummyTakerForFillFailure(object):
+        schedule = ["only-attempt"]
+
+        def add_ignored_makers(self, makers):
+            self.ignored_makers = makers
+
+        def on_finished_callback(self, *args):
+            calls.append(args)
+
+    client = DummyTakerForFillFailure()
+    proto = object.__new__(JMTakerClientProtocol)
+    proto.client = client
+
+    response = proto.on_JM_FILL_RESPONSE(False, ["maker-a", "maker-b"])
+
+    assert response == {"accepted": False}
+    assert client.ignored_makers == ["maker-a", "maker-b"]
+    assert calls == [(False, False, 0.0)]
+
 #class DummyWalletService(object):
 #    wallet = DummyWallet()
 #    def register_callbacks(self, callbacks, unconfirmed=True):
