@@ -157,19 +157,14 @@ def create_choose_units_form(selected_btc, selected_rel):
             '<option selected="selected">' + selected_rel)
     return choose_units_form
 
-def get_fidelity_bond_data(taker):
-    started = time.monotonic()
-    fbonds = taker.get_visible_fidelitybond_rows()
-    blocks = jm_single().bc_interface.get_current_block_height()
-    mediantime = jm_single().bc_interface.get_best_block_median_time()
-    interest_rate = get_interest_rate()
-    cache_key = (blocks, mediantime, interest_rate,
-                 tuple((fb["counterparty"], fb["takernick"], fb["proof"])
-                       for fb in fbonds))
-    cache = getattr(taker, "_fidelity_bond_data_cache", None)
-    if cache and cache.get("key") == cache_key:
-        return cache["value"]
+def get_fidelity_bond_cache_lock(taker):
+    if not hasattr(taker, "_fidelity_bond_data_lock"):
+        taker._fidelity_bond_data_lock = threading.Lock()
+        taker._fidelity_bond_data_cache = None
+        taker._fidelity_bond_data_refreshing_key = None
+    return taker._fidelity_bond_data_lock
 
+def calculate_fidelity_bond_data(fbonds, blocks, mediantime, interest_rate):
     bond_utxo_set = set()
     fidelity_bond_data = []
     bond_outpoint_conf_times = []
@@ -207,15 +202,83 @@ def get_fidelity_bond_data(taker):
             mediantime,
             interest_rate)
         fidelity_bond_values.append(bond_value)
-    result = (fidelity_bond_data, fidelity_bond_values,
-              bond_outpoint_conf_times)
-    taker._fidelity_bond_data_cache = {"key": cache_key, "value": result}
+    return (fidelity_bond_data, fidelity_bond_values,
+            bond_outpoint_conf_times)
+
+def refresh_fidelity_bond_data_cache(taker, cache_key, visible_key, fbonds,
+                                     blocks, mediantime, interest_rate):
+    started = time.monotonic()
+    try:
+        result = calculate_fidelity_bond_data(
+            fbonds, blocks, mediantime, interest_rate)
+        lock = get_fidelity_bond_cache_lock(taker)
+        with lock:
+            taker._fidelity_bond_data_cache = {
+                "key": cache_key,
+                "visible_key": visible_key,
+                "value": result,
+            }
+    except Exception as e:
+        result = ([], [], [])
+        log.warning("Failed to refresh fidelity-bond export data: " + repr(e))
+    finally:
+        lock = get_fidelity_bond_cache_lock(taker)
+        with lock:
+            if taker._fidelity_bond_data_refreshing_key == cache_key:
+                taker._fidelity_bond_data_refreshing_key = None
     elapsed = time.monotonic() - started
     if elapsed >= 0.25:
-        log.info("Computed fidelity-bond export data in {:.3f}s "
+        log.info("Refreshed fidelity-bond export data in {:.3f}s "
                  "(visible_bonds={}, valid_bonds={})".format(
-                     elapsed, len(fbonds), len(fidelity_bond_data)))
-    return result
+                     elapsed, len(fbonds), len(result[0])))
+
+def start_fidelity_bond_data_refresh(taker, cache_key, visible_key, fbonds,
+                                     blocks, mediantime, interest_rate):
+    lock = get_fidelity_bond_cache_lock(taker)
+    with lock:
+        if taker._fidelity_bond_data_refreshing_key == cache_key:
+            return
+        taker._fidelity_bond_data_refreshing_key = cache_key
+    thread = threading.Thread(
+        target=refresh_fidelity_bond_data_cache,
+        args=(taker, cache_key, visible_key, fbonds, blocks, mediantime,
+              interest_rate),
+        name="FidelityBondDataRefresh")
+    thread.daemon = True
+    thread.start()
+
+def get_fidelity_bond_data(taker, wait=True):
+    fbonds = taker.get_visible_fidelitybond_rows()
+    blocks = jm_single().bc_interface.get_current_block_height()
+    mediantime = jm_single().bc_interface.get_best_block_median_time()
+    interest_rate = get_interest_rate()
+    visible_key = tuple((fb["counterparty"], fb["takernick"], fb["proof"])
+                        for fb in fbonds)
+    cache_key = (blocks, mediantime, interest_rate, visible_key)
+    lock = get_fidelity_bond_cache_lock(taker)
+    with lock:
+        cache = taker._fidelity_bond_data_cache
+        if cache and cache.get("key") == cache_key:
+            return cache["value"]
+
+    if wait:
+        refresh_fidelity_bond_data_cache(
+            taker, cache_key, visible_key, fbonds, blocks, mediantime,
+            interest_rate)
+        with lock:
+            cache = taker._fidelity_bond_data_cache
+            if cache and cache.get("key") == cache_key:
+                return cache["value"]
+        return ([], [], [])
+
+    start_fidelity_bond_data_refresh(
+        taker, cache_key, visible_key, fbonds, blocks, mediantime,
+        interest_rate)
+    with lock:
+        cache = taker._fidelity_bond_data_cache
+        if cache and cache.get("visible_key") == visible_key:
+            return cache["value"]
+    return ([], [], [])
 
 class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
     def __init__(self, request, client_address, base_server):
@@ -232,7 +295,7 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
         fidelitybonds = []
         if fbonds and jm_single().bc_interface != None:
             (fidelity_bond_data, fidelity_bond_values, bond_outpoint_conf_times) =\
-                get_fidelity_bond_data(self.taker)
+                get_fidelity_bond_data(self.taker, wait=False)
             fidelity_bond_values_dict = dict([(bond_data.maker_nick, bond_value)
                 for (bond_data, _), bond_value in zip(fidelity_bond_data, fidelity_bond_values)])
             for ((parsed_bond, bond_utxo_data), fidelity_bond_value, bond_outpoint_conf_time)\
