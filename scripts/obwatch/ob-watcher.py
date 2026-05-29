@@ -158,11 +158,17 @@ def create_choose_units_form(selected_btc, selected_rel):
     return choose_units_form
 
 def get_fidelity_bond_data(taker):
+    started = time.monotonic()
     fbonds = taker.get_visible_fidelitybond_rows()
-
     blocks = jm_single().bc_interface.get_current_block_height()
     mediantime = jm_single().bc_interface.get_best_block_median_time()
     interest_rate = get_interest_rate()
+    cache_key = (blocks, mediantime, interest_rate,
+                 tuple((fb["counterparty"], fb["takernick"], fb["proof"])
+                       for fb in fbonds))
+    cache = getattr(taker, "_fidelity_bond_data_cache", None)
+    if cache and cache.get("key") == cache_key:
+        return cache["value"]
 
     bond_utxo_set = set()
     fidelity_bond_data = []
@@ -201,7 +207,15 @@ def get_fidelity_bond_data(taker):
             mediantime,
             interest_rate)
         fidelity_bond_values.append(bond_value)
-    return (fidelity_bond_data, fidelity_bond_values, bond_outpoint_conf_times)
+    result = (fidelity_bond_data, fidelity_bond_values,
+              bond_outpoint_conf_times)
+    taker._fidelity_bond_data_cache = {"key": cache_key, "value": result}
+    elapsed = time.monotonic() - started
+    if elapsed >= 0.25:
+        log.info("Computed fidelity-bond export data in {:.3f}s "
+                 "(visible_bonds={}, valid_bonds={})".format(
+                     elapsed, len(fbonds), len(fidelity_bond_data)))
+    return result
 
 class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
     def __init__(self, request, client_address, base_server):

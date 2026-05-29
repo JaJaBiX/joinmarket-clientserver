@@ -36,13 +36,18 @@ class OrderbookWatch(object):
         con = sqlite3.connect(":memory:", check_same_thread=False)
         con.row_factory = dict_factory
         self.db = con.cursor()
+        self._visible_orderbook_cache = []
+        self._visible_fidelitybond_cache = []
+        self._visibility_cache_dirty = True
+        self._visibility_cache_updated_at = None
         try:
             self.dblock.acquire(True)
             self.db.execute("CREATE TABLE orderbook(counterparty TEXT, "
                             "oid INTEGER, ordertype TEXT, minsize INTEGER, "
-                            "maxsize INTEGER, txfee INTEGER, cjfee TEXT);")
+                            "maxsize INTEGER, txfee INTEGER, cjfee TEXT, "
+                            "PRIMARY KEY(counterparty, oid));")
             self.db.execute("CREATE TABLE fidelitybonds(counterparty TEXT, "
-                "takernick TEXT, proof TEXT);");
+                "takernick TEXT, proof TEXT, PRIMARY KEY(counterparty));");
             self.db.execute("CREATE TABLE orderbook_sources("
                             "counterparty TEXT, oid INTEGER, directory TEXT, "
                             "first_seen_at INTEGER, last_seen_at INTEGER, "
@@ -73,26 +78,46 @@ class OrderbookWatch(object):
                             "orderbook_request_rx_count INTEGER, "
                             "last_non_orderbook_message_at INTEGER, "
                             "status TEXT);")
+            self.db.execute("CREATE INDEX orderbook_sources_directory_active_key "
+                            "ON orderbook_sources(directory, active, "
+                            "counterparty, oid);")
+            self.db.execute("CREATE INDEX orderbook_sources_directory_refresh "
+                            "ON orderbook_sources(directory, active, "
+                            "last_refresh_id);")
+            self.db.execute("CREATE INDEX "
+                            "fidelitybond_sources_directory_active_key "
+                            "ON fidelitybond_sources(directory, active, "
+                            "counterparty);")
+            self.db.execute("CREATE INDEX fidelitybond_sources_directory_refresh "
+                            "ON fidelitybond_sources(directory, active, "
+                            "last_refresh_id);")
+            self.db.execute("CREATE INDEX directory_peers_status_directory "
+                            "ON directory_peers(status, directory);")
             self.db.execute("CREATE VIEW visible_orderbook AS "
                             "SELECT o.counterparty, o.oid, o.ordertype, "
                             "o.minsize, o.maxsize, o.txfee, o.cjfee "
-                            "FROM orderbook AS o WHERE EXISTS ("
-                            "SELECT 1 FROM orderbook_sources AS os "
-                            "JOIN directory_peers AS dp "
-                            "ON dp.directory = os.directory "
-                            "WHERE os.counterparty = o.counterparty "
-                            "AND os.oid = o.oid "
+                            "FROM (SELECT os.counterparty, os.oid "
+                            "FROM directory_peers AS dp "
+                            "JOIN orderbook_sources AS os "
+                            "ON os.directory = dp.directory "
+                            "WHERE dp.status = 'connected' "
                             "AND os.active = 1 "
-                            "AND dp.status = 'connected');")
+                            "GROUP BY os.counterparty, os.oid) "
+                            "AS visible "
+                            "JOIN orderbook AS o "
+                            "ON o.counterparty = visible.counterparty "
+                            "AND o.oid = visible.oid;")
             self.db.execute("CREATE VIEW visible_fidelitybonds AS "
                             "SELECT f.counterparty, f.takernick, f.proof "
-                            "FROM fidelitybonds AS f WHERE EXISTS ("
-                            "SELECT 1 FROM fidelitybond_sources AS fs "
-                            "JOIN directory_peers AS dp "
-                            "ON dp.directory = fs.directory "
-                            "WHERE fs.counterparty = f.counterparty "
+                            "FROM (SELECT fs.counterparty "
+                            "FROM directory_peers AS dp "
+                            "JOIN fidelitybond_sources AS fs "
+                            "ON fs.directory = dp.directory "
+                            "WHERE dp.status = 'connected' "
                             "AND fs.active = 1 "
-                            "AND dp.status = 'connected');")
+                            "GROUP BY fs.counterparty) AS visible "
+                            "JOIN fidelitybonds AS f "
+                            "ON f.counterparty = visible.counterparty;")
         finally:
             self.dblock.release()
 
@@ -107,6 +132,32 @@ class OrderbookWatch(object):
     def _make_initial_refresh_id():
         return "initial-" + uuid.uuid4().hex
 
+    def _mark_visibility_cache_dirty_locked(self):
+        self._visibility_cache_dirty = True
+
+    @staticmethod
+    def _copy_rows(rows):
+        return [row.copy() if isinstance(row, dict) else dict(row)
+                for row in rows]
+
+    def _refresh_visibility_cache_locked(self):
+        if not self._visibility_cache_dirty:
+            return
+        started = time.monotonic()
+        self.db.execute("SELECT * FROM visible_orderbook;")
+        self._visible_orderbook_cache = self._copy_rows(self.db.fetchall())
+        self.db.execute("SELECT * FROM visible_fidelitybonds;")
+        self._visible_fidelitybond_cache = self._copy_rows(
+            self.db.fetchall())
+        self._visibility_cache_dirty = False
+        self._visibility_cache_updated_at = self._now()
+        elapsed = time.monotonic() - started
+        if elapsed >= 0.25:
+            log.info("Refreshed visible orderbook cache in {:.3f}s "
+                     "(offers={}, fidelitybonds={})".format(
+                         elapsed, len(self._visible_orderbook_cache),
+                         len(self._visible_fidelitybond_cache)))
+
     def _ensure_directory_peer_locked(self, directory):
         self.db.execute("SELECT directory FROM directory_peers WHERE "
                         "directory=?;", (directory,))
@@ -117,15 +168,26 @@ class OrderbookWatch(object):
              "orderbook_request_rx_count) VALUES(?, 0, 0);"),
             (directory,))
 
+    def _get_directory_peer_status_locked(self, directory):
+        self.db.execute("SELECT status FROM directory_peers WHERE "
+                        "directory=?;", (directory,))
+        row = self.db.fetchone()
+        return row["status"] if row else None
+
     def _set_directory_peer_fields_locked(self, directory, **fields):
         if not directory or not fields:
             return
         self._ensure_directory_peer_locked(directory)
+        old_status = None
+        if "status" in fields:
+            old_status = self._get_directory_peer_status_locked(directory)
         keys = sorted(fields.keys())
         assignments = ", ".join([key + "=?" for key in keys])
         values = [fields[key] for key in keys] + [directory]
         self.db.execute("UPDATE directory_peers SET " + assignments +
                         " WHERE directory=?;", values)
+        if "status" in fields and fields["status"] != old_status:
+            self._mark_visibility_cache_dirty_locked()
 
     def _get_or_create_directory_refresh_id_locked(self, directory):
         self._ensure_directory_peer_locked(directory)
@@ -247,6 +309,7 @@ class OrderbookWatch(object):
              "(?, ?, ?, ?, ?, ?, ?, ?);"),
             (counterparty, oid, directory, first_seen_at, now,
              refresh_id, 1, None))
+        self._mark_visibility_cache_dirty_locked()
 
     def _deactivate_order_source_locked(self, counterparty, oid, directory,
                                         now):
@@ -255,6 +318,7 @@ class OrderbookWatch(object):
              "inactive_at=COALESCE(inactive_at, ?) "
              "WHERE counterparty=? AND oid=? AND directory=?;"),
             (now, counterparty, oid, directory))
+        self._mark_visibility_cache_dirty_locked()
 
     def _deactivate_fidelitybond_source_locked(self, counterparty, directory,
                                                now):
@@ -263,6 +327,7 @@ class OrderbookWatch(object):
              "inactive_at=COALESCE(inactive_at, ?) "
              "WHERE counterparty=? AND directory=?;"),
             (now, counterparty, directory))
+        self._mark_visibility_cache_dirty_locked()
 
     def _has_active_order_source_locked(self, counterparty, oid):
         self.db.execute(
@@ -329,6 +394,7 @@ class OrderbookWatch(object):
             self.db.execute(
                 ("DELETE FROM orderbook WHERE counterparty=? AND oid=?;"),
                 (counterparty, oid))
+            self._mark_visibility_cache_dirty_locked()
 
     def _prune_fidelitybond_if_no_active_source_locked(self, counterparty, now,
                                                        grace_seconds):
@@ -341,6 +407,7 @@ class OrderbookWatch(object):
         if self._should_prune_inactive(now, inactive_at, grace_seconds):
             self.db.execute("DELETE FROM fidelitybonds WHERE counterparty=?;",
                             (counterparty,))
+            self._mark_visibility_cache_dirty_locked()
 
     def _delete_order_if_no_sources_locked(self, counterparty, oid):
         self.db.execute(
@@ -351,6 +418,7 @@ class OrderbookWatch(object):
             self.db.execute(
                 ("DELETE FROM orderbook WHERE counterparty=? AND oid=?;"),
                 (counterparty, oid))
+            self._mark_visibility_cache_dirty_locked()
 
     def _delete_fidelitybond_if_no_sources_locked(self, counterparty):
         self.db.execute(
@@ -360,6 +428,7 @@ class OrderbookWatch(object):
         if self.db.fetchone() is None:
             self.db.execute("DELETE FROM fidelitybonds WHERE counterparty=?;",
                             (counterparty,))
+            self._mark_visibility_cache_dirty_locked()
 
     def _prune_orphan_order_sources_locked(self, now, retention_seconds):
         if retention_seconds < 0:
@@ -460,6 +529,7 @@ class OrderbookWatch(object):
              "(?, ?, ?, ?, ?, ?, ?);"),
             (counterparty, directory, first_seen_at, now,
              refresh_id, 1, None))
+        self._mark_visibility_cache_dirty_locked()
 
     def prune_unseen_sources_for_directories(self, directories, refresh_id):
         directories = [d for d in directories if d]
@@ -482,6 +552,7 @@ class OrderbookWatch(object):
                      "last_refresh_id != ?;"),
                     (now, directory, refresh_id))
             self._prune_sources_locked(now)
+            self._mark_visibility_cache_dirty_locked()
         finally:
             self.dblock.release()
 
@@ -514,16 +585,16 @@ class OrderbookWatch(object):
     def get_visible_orderbook_rows(self):
         try:
             self.dblock.acquire(True)
-            self.db.execute("SELECT * FROM visible_orderbook;")
-            return self.db.fetchall()
+            self._refresh_visibility_cache_locked()
+            return self._copy_rows(self._visible_orderbook_cache)
         finally:
             self.dblock.release()
 
     def get_visible_fidelitybond_rows(self):
         try:
             self.dblock.acquire(True)
-            self.db.execute("SELECT * FROM visible_fidelitybonds;")
-            return self.db.fetchall()
+            self._refresh_visibility_cache_locked()
+            return self._copy_rows(self._visible_fidelitybond_cache)
         finally:
             self.dblock.release()
 
@@ -623,12 +694,10 @@ class OrderbookWatch(object):
                 self._upsert_order_source_locked(
                     counterparty, oid, source_directory, now)
             self.db.execute(
-                ("DELETE FROM orderbook WHERE counterparty=? "
-                 "AND oid=?;"), (counterparty, oid))
-            self.db.execute(
-                'INSERT INTO orderbook VALUES(?, ?, ?, ?, ?, ?, ?);',
+                'INSERT OR REPLACE INTO orderbook VALUES(?, ?, ?, ?, ?, ?, ?);',
                 (counterparty, oid, ordertype, minsize, maxsize, txfee,
                  cjfee))  # any parseable Decimal is a valid cjfee
+            self._mark_visibility_cache_dirty_locked()
         except InvalidOperation:
             log.debug("Got invalid cjfee: " + str(cjfee) + " from " + counterparty)
         except Exception as e:
@@ -652,6 +721,7 @@ class OrderbookWatch(object):
             self.db.execute(
                 ("DELETE FROM orderbook WHERE "
                  "counterparty=? AND oid=?;"), (counterparty, oid))
+            self._mark_visibility_cache_dirty_locked()
         finally:
             self.dblock.release()
 
@@ -670,10 +740,9 @@ class OrderbookWatch(object):
                 self._record_directory_response_locked(source_directory, now)
                 self._upsert_fidelitybond_source_locked(
                     nick, source_directory, now)
-            self.db.execute("DELETE FROM fidelitybonds WHERE counterparty=?;",
-                            (nick, ))
-            self.db.execute("INSERT INTO fidelitybonds VALUES(?, ?, ?);",
+            self.db.execute("INSERT OR REPLACE INTO fidelitybonds VALUES(?, ?, ?);",
                 (nick, taker_nick, fidelity_bond_proof_msg))
+            self._mark_visibility_cache_dirty_locked()
         finally:
             self.dblock.release()
 
@@ -693,6 +762,7 @@ class OrderbookWatch(object):
                      "WHERE counterparty=? AND directory=? AND active=1;"),
                     (now, nick, source_directory))
                 self._prune_sources_locked(now)
+                self._mark_visibility_cache_dirty_locked()
                 return
             self.db.execute('DELETE FROM orderbook_sources WHERE '
                             'counterparty=?;', (nick,))
@@ -702,6 +772,7 @@ class OrderbookWatch(object):
                             (nick,))
             self.db.execute('DELETE FROM fidelitybonds WHERE counterparty=?;',
                             (nick,))
+            self._mark_visibility_cache_dirty_locked()
         finally:
             self.dblock.release()
 
@@ -712,5 +783,6 @@ class OrderbookWatch(object):
             self.db.execute('DELETE FROM fidelitybonds;')
             self.db.execute('DELETE FROM orderbook_sources;')
             self.db.execute('DELETE FROM fidelitybond_sources;')
+            self._mark_visibility_cache_dirty_locked()
         finally:
             self.dblock.release()

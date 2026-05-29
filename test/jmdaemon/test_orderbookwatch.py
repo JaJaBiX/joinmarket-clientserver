@@ -35,6 +35,10 @@ def get_ob():
     ob.dust_threshold = 2
     return ob
 
+def get_direct_visible_orderbook_rows(ob):
+    return [dict(row) for row in
+            ob.db.execute('SELECT * FROM visible_orderbook;').fetchall()]
+
 @pytest.mark.parametrize(
     "badtopic",
     [("abc|"),
@@ -299,6 +303,68 @@ def test_visible_fidelitybonds_require_active_connected_source():
     ob.on_nick_leave(maker, source_directory=dn2)
     assert len(ob.get_raw_fidelitybond_rows()) == 1
     assert len(ob.get_visible_fidelitybond_rows()) == 0
+
+def test_visible_orderbook_cache_tracks_state_changes():
+    ob = get_ob()
+    maker = "J5CacheMaker"
+    directory = "dn-cache.onion:5222"
+    offer = (maker, "0", "reloffer", "3000", "4000", "2", "0.3")
+
+    assert ob.get_visible_orderbook_rows() == []
+    assert ob._visibility_cache_dirty is False
+
+    ob.on_order_seen(*offer, source_directory=directory)
+    assert ob._visibility_cache_dirty is True
+    visible_rows = ob.get_visible_orderbook_rows()
+    assert visible_rows == get_direct_visible_orderbook_rows(ob)
+    assert len(visible_rows) == 1
+    assert ob._visibility_cache_dirty is False
+
+    visible_rows[0]["counterparty"] = "mutated"
+    assert ob.get_visible_orderbook_rows()[0]["counterparty"] == maker
+
+    ob.record_directory_disconnected(directory)
+    assert ob.get_visible_orderbook_rows() == get_direct_visible_orderbook_rows(ob)
+    assert len(ob.get_visible_orderbook_rows()) == 0
+
+    ob.record_directory_connected(directory)
+    assert ob.get_visible_orderbook_rows() == get_direct_visible_orderbook_rows(ob)
+    assert len(ob.get_visible_orderbook_rows()) == 1
+
+    ob.on_order_cancel(maker, "0", source_directory=directory)
+    assert ob.get_visible_orderbook_rows() == get_direct_visible_orderbook_rows(ob)
+    assert len(ob.get_visible_orderbook_rows()) == 0
+
+def test_connected_directory_metadata_does_not_dirty_visible_cache():
+    ob = get_ob()
+    directory = "dn-message-cache.onion:5222"
+    offer = ("J5MessageCacheMaker", "0", "reloffer", "3000", "4000",
+             "2", "0.3")
+
+    ob.on_order_seen(*offer, source_directory=directory)
+    assert len(ob.get_visible_orderbook_rows()) == 1
+    assert ob._visibility_cache_dirty is False
+
+    ob.record_directory_message(directory, "privmsg", "not a command")
+    assert ob._visibility_cache_dirty is False
+    assert len(ob.get_visible_orderbook_rows()) == 1
+
+def test_orderbook_payload_key_replaces_duplicate_offer():
+    ob = get_ob()
+    maker = "J5ReplaceMaker"
+    directory = "dn-replace.onion:5222"
+    offer = (maker, "0", "reloffer", "3000", "4000", "2", "0.3")
+    updated_offer = (maker, "0", "reloffer", "3000", "9000", "2", "0.3")
+
+    ob.on_order_seen(*offer, source_directory=directory)
+    ob.on_order_seen(*updated_offer, source_directory=directory)
+
+    raw_rows = ob.get_raw_orderbook_rows()
+    visible_rows = ob.get_visible_orderbook_rows()
+    assert len(raw_rows) == 1
+    assert len(visible_rows) == 1
+    assert raw_rows[0]["maxsize"] == 9000
+    assert visible_rows[0]["maxsize"] == 9000
 
 def test_directory_message_metadata_tracks_relayed_orderbook_requests():
     ob = get_ob()
