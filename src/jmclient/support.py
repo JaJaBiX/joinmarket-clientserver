@@ -247,9 +247,44 @@ def _get_is_within_max_limits(max_fee_rel, max_fee_abs, cjvalue):
     return check_max_fee
 
 
-def choose_orders(offers, cj_amount, n, chooseOrdersBy, ignored_makers=None,
-                  pick=False, allowed_types=["sw0reloffer", "sw0absoffer"],
-                  max_cj_fee=(1, float('inf'))):
+def _maker_set(makers):
+    if isinstance(makers, str):
+        makers = [makers]
+    return set(m for m in (makers or []) if m)
+
+
+def _exclusion_passes(ignored_makers=None, hard_excluded_makers=None,
+                      cooldown_makers=None, soft_ignored_makers=None,
+                      relax_cooldowns=False, relax_soft_ignored=True):
+    hard = _maker_set(ignored_makers) | _maker_set(hard_excluded_makers)
+    cooldown = _maker_set(cooldown_makers)
+    soft = _maker_set(soft_ignored_makers)
+    cooldown.difference_update(hard)
+    soft.difference_update(hard | cooldown)
+
+    passes = [("strict", hard | cooldown | soft)]
+    if relax_soft_ignored and soft:
+        passes.append(("without_soft_ignored", hard | cooldown))
+    if relax_cooldowns and cooldown:
+        if relax_soft_ignored:
+            passes.append(("without_cooldowns", hard))
+        else:
+            passes.append(("without_cooldowns", hard | soft))
+
+    unique_passes = []
+    seen = set()
+    for label, excluded in passes:
+        key = tuple(sorted(excluded))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_passes.append((label, excluded))
+    return unique_passes
+
+
+def _choose_orders_once(offers, cj_amount, n, chooseOrdersBy, ignored_makers=None,
+                        pick=False, allowed_types=["sw0reloffer", "sw0absoffer"],
+                        max_cj_fee=(1, float('inf'))):
     is_within_max_limits = _get_is_within_max_limits(
         max_cj_fee[0], max_cj_fee[1], cj_amount)
     if ignored_makers is None:
@@ -308,7 +343,31 @@ def choose_orders(offers, cj_amount, n, chooseOrdersBy, ignored_makers=None,
     return result, total_cj_fee
 
 
-def choose_sweep_orders(offers,
+def choose_orders(offers, cj_amount, n, chooseOrdersBy, ignored_makers=None,
+                  pick=False, allowed_types=["sw0reloffer", "sw0absoffer"],
+                  max_cj_fee=(1, float('inf')),
+                  hard_excluded_makers=None, cooldown_makers=None,
+                  soft_ignored_makers=None, relax_cooldowns=False,
+                  relax_soft_ignored=True):
+    for label, excluded in _exclusion_passes(
+            ignored_makers=ignored_makers,
+            hard_excluded_makers=hard_excluded_makers,
+            cooldown_makers=cooldown_makers,
+            soft_ignored_makers=soft_ignored_makers,
+            relax_cooldowns=relax_cooldowns,
+            relax_soft_ignored=relax_soft_ignored):
+        result, total_cj_fee = _choose_orders_once(
+            offers, cj_amount, n, chooseOrdersBy,
+            ignored_makers=excluded, pick=pick, allowed_types=allowed_types,
+            max_cj_fee=max_cj_fee)
+        if result is not None:
+            if label != "strict":
+                log.warn("Maker exclusion fallback used: {}".format(label))
+            return result, total_cj_fee
+    return None, 0
+
+
+def _choose_sweep_orders_once(offers,
                         total_input_value,
                         total_txfee,
                         n,
@@ -402,3 +461,34 @@ def choose_sweep_orders(offers,
     result = dict([(o['counterparty'], o) for o in chosen_orders])
     log.debug('cj amount = ' + str(cj_amount))
     return result, cj_amount, total_fee
+
+
+def choose_sweep_orders(offers,
+                        total_input_value,
+                        total_txfee,
+                        n,
+                        chooseOrdersBy,
+                        ignored_makers=None,
+                        allowed_types=['sw0reloffer', 'sw0absoffer'],
+                        max_cj_fee=(1, float('inf')),
+                        hard_excluded_makers=None,
+                        cooldown_makers=None,
+                        soft_ignored_makers=None,
+                        relax_cooldowns=False,
+                        relax_soft_ignored=True):
+    for label, excluded in _exclusion_passes(
+            ignored_makers=ignored_makers,
+            hard_excluded_makers=hard_excluded_makers,
+            cooldown_makers=cooldown_makers,
+            soft_ignored_makers=soft_ignored_makers,
+            relax_cooldowns=relax_cooldowns,
+            relax_soft_ignored=relax_soft_ignored):
+        result = _choose_sweep_orders_once(
+            offers, total_input_value, total_txfee, n, chooseOrdersBy,
+            ignored_makers=excluded, allowed_types=allowed_types,
+            max_cj_fee=max_cj_fee)
+        if result[0] is not None:
+            if label != "strict":
+                log.warn("Maker exclusion fallback used: {}".format(label))
+            return result
+    return None, 0, 0

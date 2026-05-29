@@ -97,6 +97,69 @@ def test_choose_orders():
     assert result == None
     assert cjamount == 0
     assert total_fee == 0
+
+
+def test_choose_orders_soft_ignored_fallback():
+    orderbook = copy.deepcopy(t_orderbook)
+    soft_maker = orderbook[0]["counterparty"]
+
+    orders_fees = choose_orders(
+        orderbook, 10000000, 6, cheapest_order_choose,
+        soft_ignored_makers=[soft_maker])
+
+    assert len(orders_fees[0]) == 6
+    assert soft_maker in orders_fees[0]
+
+
+def test_choose_orders_hard_excludes_are_not_relaxed():
+    orderbook = copy.deepcopy(t_orderbook)
+    hard_maker = orderbook[0]["counterparty"]
+
+    orders_fees = choose_orders(
+        orderbook, 10000000, 6, cheapest_order_choose,
+        hard_excluded_makers=[hard_maker],
+        soft_ignored_makers=[orderbook[1]["counterparty"]],
+        relax_cooldowns=True)
+
+    assert orders_fees == (None, 0)
+
+
+def test_choose_orders_cooldowns_are_strict_by_default():
+    orderbook = copy.deepcopy(t_orderbook)
+    cooldown_maker = orderbook[0]["counterparty"]
+
+    orders_fees = choose_orders(
+        orderbook, 10000000, 6, cheapest_order_choose,
+        cooldown_makers=[cooldown_maker])
+
+    assert orders_fees == (None, 0)
+
+
+def test_choose_orders_cooldowns_can_be_relaxed():
+    orderbook = copy.deepcopy(t_orderbook)
+    cooldown_maker = orderbook[0]["counterparty"]
+
+    orders_fees = choose_orders(
+        orderbook, 10000000, 6, cheapest_order_choose,
+        cooldown_makers=[cooldown_maker],
+        relax_cooldowns=True)
+
+    assert len(orders_fees[0]) == 6
+    assert cooldown_maker in orders_fees[0]
+
+
+def test_choose_sweep_orders_uses_soft_fallback():
+    orderbook = copy.deepcopy(t_orderbook)
+    soft_maker = orderbook[0]["counterparty"]
+
+    result, cjamount, total_fee = choose_sweep_orders(
+        orderbook, 50000000, 30000, 6, cheapest_order_choose,
+        soft_ignored_makers=[soft_maker])
+
+    assert len(result) == 6
+    assert soft_maker in result
+    assert cjamount > 0
+    assert total_fee > 0
     
     #here we doctor the orderbook; (a) include an absfee
     #(b) add an unrecognized ordertype (does not raise, ignores)

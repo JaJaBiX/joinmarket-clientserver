@@ -341,6 +341,26 @@ def test_auth_pub_not_found(setup_taker):
     assert res[1] == "Not enough counterparties responded to fill, giving up"
     jm_single().bc_interface.insert_fake_query_results(None)
 
+
+def test_prepare_maker_selection_retry_rewinds_current_schedule(setup_taker):
+    taker = get_taker([(0, 20000000, 3,
+                        "mnsquzxrHXpFsZeL42qwbKdCP2y1esN3qw",
+                        0, NO_ROUNDING)])
+    orderbook = copy.deepcopy(t_orderbook)
+    res = taker.initialize(orderbook, [])
+    assert res[0]
+    assert taker.schedule_index == 0
+
+    assert taker.prepare_maker_selection_retry(["maker-a"], "test")
+    assert taker.schedule_index == -1
+    assert "maker-a" in taker.ignored_makers
+
+    taker.schedule_index = 0
+    taker.latest_tx = object()
+    assert not taker.prepare_maker_selection_retry(["maker-b"], "stage2")
+    assert taker.schedule_index == 0
+
+
 @pytest.mark.parametrize(
     "schedule, highfee, toomuchcoins, minmakers, notauthed, ignored, nocommit",
     [

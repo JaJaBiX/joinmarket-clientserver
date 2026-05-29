@@ -76,16 +76,20 @@ class DummyStage2Taker(object):
     stage2_valid_sig_makers = ["maker1"]
 
 
-def make_stage2_test_daemon():
+def make_stage2_test_daemon(tmp_path=None):
     load_test_config()
+    if tmp_path is not None:
+        jm_single().config.set(
+            "POLICY", "taker_maker_penalty_db",
+            str(tmp_path / "taker-maker-policy.sqlite3"))
     daemon = JMWalletDaemonT(0, 0, tls=False)
     daemon.auth_disabled = True
     daemon.wss_factory = DummyWSSFactory()
     return daemon
 
 
-def test_stage2_watchdog_schedules_and_cancels(monkeypatch):
-    daemon = make_stage2_test_daemon()
+def test_stage2_watchdog_schedules_and_cancels(monkeypatch, tmp_path):
+    daemon = make_stage2_test_daemon(tmp_path)
     taker = DummyStage2Taker()
     taker.nonrespondants = ["maker1"]
     taker.stage2_expected_makers = ["maker1"]
@@ -115,8 +119,8 @@ def test_stage2_watchdog_schedules_and_cancels(monkeypatch):
     assert daemon.taker_stage2_timeout_attempt_id is None
 
 
-def test_stage2_watchdog_timeout_fails_and_cools_down():
-    daemon = make_stage2_test_daemon()
+def test_stage2_watchdog_timeout_fails_and_cools_down(tmp_path):
+    daemon = make_stage2_test_daemon(tmp_path)
     taker = DummyStage2Taker()
     daemon.taker = taker
     daemon.coinjoin_state = CJ_TAKER_RUNNING
@@ -126,18 +130,56 @@ def test_stage2_watchdog_timeout_fails_and_cools_down():
     assert taker.aborted is True
     assert daemon.taker is None
     assert daemon.coinjoin_state == CJ_NOT_RUNNING
-    assert "maker2" in daemon.stage2_maker_cooldowns
+    assert "maker2" in daemon.get_active_stage2_maker_cooldowns()
     assert daemon.wss_factory.status_updates[-1] == CJ_NOT_RUNNING
 
 
-def test_stage2_cooldown_prunes_expired_makers():
-    daemon = make_stage2_test_daemon()
-    daemon.stage2_maker_cooldowns = {
-        "expired": 9,
-        "active": 11,
-    }
+def test_stage2_cooldown_prunes_expired_makers(tmp_path):
+    daemon = make_stage2_test_daemon(tmp_path)
+    old_cooldown = jm_single().config.get(
+        "POLICY", "taker_stage2_maker_cooldown_seconds")
+    jm_single().config.set("POLICY", "taker_stage2_maker_cooldown_seconds", "10")
+    try:
+        daemon.add_stage2_maker_cooldowns(
+            ["expired"], attempt_id="attempt-expired", now=0)
+        daemon.add_stage2_maker_cooldowns(
+            ["active"], attempt_id="attempt-active", now=5)
 
-    assert daemon.get_active_stage2_maker_cooldowns(now=10) == ["active"]
+        assert daemon.get_active_stage2_maker_cooldowns(now=10) == ["active"]
+    finally:
+        jm_single().config.set(
+            "POLICY", "taker_stage2_maker_cooldown_seconds", old_cooldown)
+
+
+def test_stage2_cooldown_survives_new_daemon_store(tmp_path):
+    daemon = make_stage2_test_daemon(tmp_path)
+    daemon.add_stage2_maker_cooldowns(
+        ["maker-persist"], attempt_id="attempt-1", now=10)
+    if daemon.maker_penalty_store is not None:
+        daemon.maker_penalty_store.close()
+        daemon.maker_penalty_store = None
+
+    reopened = make_stage2_test_daemon(tmp_path)
+
+    assert "maker-persist" in reopened.get_active_stage2_maker_cooldowns(now=11)
+
+
+def test_stage2_repeated_cooldowns_promote_to_hard_ban(tmp_path):
+    daemon = make_stage2_test_daemon(tmp_path)
+    old_threshold = jm_single().config.get(
+        "POLICY", "taker_maker_cooldown_ban_threshold")
+    try:
+        jm_single().config.set(
+            "POLICY", "taker_maker_cooldown_ban_threshold", "2")
+        daemon.add_stage2_maker_cooldowns(
+            ["maker-ban"], attempt_id="attempt-1", now=10)
+        daemon.add_stage2_maker_cooldowns(
+            ["maker-ban"], attempt_id="attempt-2", now=20)
+
+        assert "maker-ban" in daemon.get_active_taker_hard_bans(now=21)
+    finally:
+        jm_single().config.set(
+            "POLICY", "taker_maker_cooldown_ban_threshold", old_threshold)
 
 class WalletRPCTestBase(object):
     """ Base class for set up of tests of the

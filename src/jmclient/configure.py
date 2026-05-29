@@ -276,6 +276,15 @@ tx_fees_factor = 0.2
 # maximum fee.
 absurd_fee_per_kb = 350000
 taker_stage2_maker_cooldown_seconds = 3600
+taker_persistent_maker_ban_list =
+taker_persistent_maker_ban_file =
+taker_maker_penalty_db =
+taker_maker_cooldown_ban_threshold = 3
+taker_maker_cooldown_ban_window_seconds = 604800
+taker_maker_auto_ban_seconds = 0
+taker_relax_stage2_cooldown_on_low_liquidity = false
+taker_relax_soft_ignored_makers_on_low_liquidity = true
+taker_max_maker_replacement_attempts = 3
 
 # In decimal, the maximum allowable change either lower or
 # higher, that the fee rate used for coinjoin sweeps is

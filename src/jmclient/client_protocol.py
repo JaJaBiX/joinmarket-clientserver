@@ -651,6 +651,17 @@ class JMTakerClientProtocol(JMClientProtocol):
             #the finished callback should already be called.
             jlog.info("Tx was already pushed; ignoring")
 
+    def retry_maker_selection(self, failed_makers, reason):
+        if not failed_makers:
+            return False
+        retry = getattr(self.client, "prepare_maker_selection_retry", None)
+        if not retry:
+            return False
+        if retry(failed_makers, reason):
+            reactor.callLater(0, self.get_offers)
+            return True
+        return False
+
     @commands.JMUp.responder
     def on_JM_UP(self):
         d = self.callRemote(commands.JMSetup,
@@ -685,7 +696,10 @@ class JMTakerClientProtocol(JMClientProtocol):
         """
         if not success:
             jlog.info("Makers who didnt respond: " + str(ioauth_data))
-            self.client.add_ignored_makers(ioauth_data)
+            if self.retry_maker_selection(ioauth_data, "fill_response_failure"):
+                return {'accepted': True}
+            if not getattr(self.client, "prepare_maker_selection_retry", None):
+                self.client.add_ignored_makers(ioauth_data)
             if len(self.client.schedule) == 1:
                 self.client.on_finished_callback(False, False, 0.0)
                 return {'accepted': False}
@@ -696,6 +710,10 @@ class JMTakerClientProtocol(JMClientProtocol):
             if not retval[0]:
                 jlog.info("Taker is not continuing, phase 2 abandoned.")
                 jlog.info("Reason: " + str(retval[1]))
+                failed_makers = retval[2] if len(retval) > 2 else []
+                if self.retry_maker_selection(failed_makers,
+                                              "stage1_ioauth_failure"):
+                    return {'accepted': True}
                 if len(self.client.schedule) == 1:
                     # see comment for the same invocation in on_JM_OFFERS;
                     # the logic here is the same.

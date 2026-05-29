@@ -57,7 +57,10 @@ class Taker(object):
                  ignored_makers=None,
                  attempt_id=None,
                  stage2_start_callback=None,
-                 stage2_complete_callback=None):
+                 stage2_complete_callback=None,
+                 hard_excluded_makers=None,
+                 cooldown_makers=None,
+                 soft_ignored_makers=None):
         """`schedule`` must be a list of tuples: (see sample_schedule_for_testnet
         for explanation of syntax, also schedule.py module in this directory),
         which will be a sequence of joins to do.
@@ -115,11 +118,18 @@ class Taker(object):
         #who have not responded or behaved maliciously at any
         #stage of the protocol.
         self.ignored_makers = [] if not ignored_makers else ignored_makers
+        self.hard_excluded_makers = [] if not hard_excluded_makers else \
+            hard_excluded_makers
+        self.cooldown_makers = [] if not cooldown_makers else cooldown_makers
+        self.soft_ignored_makers = [] if not soft_ignored_makers else \
+            soft_ignored_makers
 
         #Used in attempts to complete with subset after second round failure:
         self.honest_makers = []
         #Toggle: if set, only honest makers will be used from orderbook
         self.honest_only = False
+        self.maker_replacement_attempts = 0
+        self.maker_replacement_schedule_index = None
 
         #Temporary (per transaction) list of makers that keeps track of
         #which have responded, both in Stage 1 and Stage 2. Before each
@@ -146,6 +156,12 @@ class Taker(object):
         self.stage2_tx_sent_at = None
         self.stage2_start_callback = stage2_start_callback
         self.stage2_complete_callback = stage2_complete_callback
+
+    def _get_policy_bool(self, option, default=False):
+        try:
+            return jm_single().config.getboolean("POLICY", option)
+        except Exception:
+            return default
 
     def default_taker_info_callback(self, infotype, msg):
         jlog.info(infotype + ":" + msg)
@@ -196,6 +212,43 @@ class Taker(object):
                 return
         self.honest_only = truefalse
 
+    def get_max_maker_replacement_attempts(self):
+        try:
+            return jm_single().config.getint(
+                "POLICY", "taker_max_maker_replacement_attempts")
+        except Exception:
+            return 3
+
+    def prepare_maker_selection_retry(self, failed_makers, reason=""):
+        """Retry this schedule entry before the transaction is built.
+
+        Failed makers become hard exclusions for this Taker run. Once
+        ``latest_tx`` exists, maker inputs are fixed and stage-2 cooldown
+        handling must be used instead of replacement.
+        """
+        failed = [m for m in (failed_makers or []) if m]
+        if not failed:
+            return False
+        if self.latest_tx is not None:
+            return False
+        self.add_ignored_makers(failed)
+        max_attempts = self.get_max_maker_replacement_attempts()
+        if max_attempts <= 0:
+            return False
+        if self.maker_replacement_attempts >= max_attempts:
+            return False
+        if self.schedule_index < 0:
+            return False
+
+        self.maker_replacement_attempts += 1
+        self.maker_replacement_schedule_index = self.schedule_index
+        self.schedule_index -= 1
+        self._log_attempt(
+            "maker_replacement_retry attempt={}/{} failed_makers={} reason={}".
+            format(self.maker_replacement_attempts, max_attempts,
+                   self._format_maker_list(failed), reason))
+        return True
+
     def initialize(self, orderbook, fidelity_bonds_info):
         """Once the daemon is active and has returned the current orderbook,
         select offers, re-initialize variables and prepare a commitment,
@@ -213,6 +266,9 @@ class Taker(object):
         else:
             #read the settings from the schedule entry
             si = self.schedule[self.schedule_index]
+            if self.maker_replacement_schedule_index != self.schedule_index:
+                self.maker_replacement_attempts = 0
+                self.maker_replacement_schedule_index = self.schedule_index
             self.mixdepth = si[0]
             self.cjamount = si[1]
             rounding = si[5]
@@ -313,10 +369,22 @@ class Taker(object):
             else:
                 jlog.error("Unrecognized wallet type, taker cannot continue.")
                 return False
+            self._log_attempt(
+                "maker_filter hard_bans={} cooldowns={} soft_ignored={}".
+                format(self._format_maker_list(self.hard_excluded_makers),
+                       self._format_maker_list(self.cooldown_makers),
+                       self._format_maker_list(self.soft_ignored_makers)))
             self.orderbook, self.total_cj_fee = choose_orders(
                 orderbook, self.cjamount, self.n_counterparties, self.order_chooser,
                 self.ignored_makers, allowed_types=allowed_types,
-                max_cj_fee=self.max_cj_fee)
+                max_cj_fee=self.max_cj_fee,
+                hard_excluded_makers=self.hard_excluded_makers,
+                cooldown_makers=self.cooldown_makers,
+                soft_ignored_makers=self.soft_ignored_makers,
+                relax_cooldowns=self._get_policy_bool(
+                    "taker_relax_stage2_cooldown_on_low_liquidity", False),
+                relax_soft_ignored=self._get_policy_bool(
+                    "taker_relax_soft_ignored_makers_on_low_liquidity", True))
             if self.orderbook is None:
                 #Failure to get an orderbook means order selection failed
                 #for some reason; no action is taken, we let the stallMonitor
@@ -410,7 +478,14 @@ class Taker(object):
                 self.orderbook, total_value, self.total_txfee,
                 self.n_counterparties, self.order_chooser,
                 self.ignored_makers, allowed_types=allowed_types,
-                max_cj_fee=self.max_cj_fee)
+                max_cj_fee=self.max_cj_fee,
+                hard_excluded_makers=self.hard_excluded_makers,
+                cooldown_makers=self.cooldown_makers,
+                soft_ignored_makers=self.soft_ignored_makers,
+                relax_cooldowns=self._get_policy_bool(
+                    "taker_relax_stage2_cooldown_on_low_liquidity", False),
+                relax_soft_ignored=self._get_policy_bool(
+                    "taker_relax_soft_ignored_makers_on_low_liquidity", True))
             if not self.orderbook:
                 self.taker_info_callback("ABORT",
                                 "Could not find orders to complete transaction")
@@ -479,9 +554,11 @@ class Taker(object):
         #know for sure that the data meets all business-logic requirements.
         if len(self.maker_utxo_data) < jm_single().config.getint(
                 "POLICY", "minimum_makers"):
+            self.add_ignored_makers(stage1_missing)
             self.taker_info_callback("INFO", "Not enough counterparties, aborting.")
             return (False,
-                    "Not enough counterparties responded to fill, giving up")
+                    "Not enough counterparties responded to fill, giving up",
+                    stage1_missing)
 
         self.taker_info_callback("INFO", "Got all parts, enough to build a tx")
 

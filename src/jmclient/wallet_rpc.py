@@ -26,6 +26,7 @@ from jmclient import Taker, jm_single, \
     tumbler_filter_orders_callback, tumbler_taker_finished_update, \
     validate_address, FidelityBondMixin, BaseWallet, WalletError, \
     ScheduleGenerationErrorNoFunds, BIP39WalletMixin, auth, wallet_signmessage
+from jmclient.maker_penalty_store import MakerPenaltyStore
 from jmbase.support import get_log, utxostr_to_utxo, JM_CORE_VERSION
 
 jlog = get_log()
@@ -192,6 +193,9 @@ class JMWalletDaemon(Service):
         self.tumble_log = None
         self.taker_stage2_timeout_call = None
         self.taker_stage2_timeout_attempt_id = None
+        self.maker_penalty_store = None
+        self.maker_penalty_store_failed = False
+        # Fallback only, used if the SQLite store cannot be opened.
         self.stage2_maker_cooldowns = {}
         # save settings we might temporary change runtime
         self.default_policy_tx_fees = jm_single().config.get("POLICY",
@@ -247,6 +251,19 @@ class JMWalletDaemon(Service):
         return self.get_config_int(
             "POLICY", "taker_stage2_maker_cooldown_seconds", 3600)
 
+    def get_maker_penalty_store(self):
+        if self.maker_penalty_store is not None:
+            return self.maker_penalty_store
+        if self.maker_penalty_store_failed:
+            return None
+        try:
+            self.maker_penalty_store = MakerPenaltyStore()
+        except Exception as exc:
+            jlog.error("Could not open maker penalty SQLite store: {}".format(exc))
+            self.maker_penalty_store_failed = True
+            self.maker_penalty_store = None
+        return self.maker_penalty_store
+
     def make_taker_attempt_id(self):
         return "rpc-cj-" + uuid.uuid4().hex[:12]
 
@@ -258,6 +275,10 @@ class JMWalletDaemon(Service):
         self.taker_stage2_timeout_attempt_id = None
 
     def prune_stage2_maker_cooldowns(self, now=None):
+        store = self.get_maker_penalty_store()
+        if store is not None:
+            store.prune(now)
+            return
         if now is None:
             now = time.time()
         self.stage2_maker_cooldowns = {
@@ -267,10 +288,26 @@ class JMWalletDaemon(Service):
         }
 
     def get_active_stage2_maker_cooldowns(self, now=None):
+        store = self.get_maker_penalty_store()
+        if store is not None:
+            store.prune(now)
+            return store.active_cooldowns(now)
         self.prune_stage2_maker_cooldowns(now)
         return sorted(self.stage2_maker_cooldowns.keys())
 
-    def add_stage2_maker_cooldowns(self, makers, now=None):
+    def get_active_taker_hard_bans(self, now=None):
+        store = self.get_maker_penalty_store()
+        if store is not None:
+            store.prune(now)
+            return store.active_hard_bans(now)
+        return []
+
+    def add_stage2_maker_cooldowns(self, makers, attempt_id=None, now=None):
+        store = self.get_maker_penalty_store()
+        if store is not None:
+            store.record_stage2_cooldown(
+                makers, attempt_id or self.taker_stage2_timeout_attempt_id or "", now)
+            return
         if now is None:
             now = time.time()
         cooldown_seconds = self.get_taker_stage2_maker_cooldown_seconds()
@@ -328,7 +365,7 @@ class JMWalletDaemon(Service):
                       attempt_id, ",".join(sorted(expected)),
                       ",".join(sorted(valid)),
                       ",".join(sorted(missing))))
-        self.add_stage2_maker_cooldowns(missing)
+        self.add_stage2_maker_cooldowns(missing, attempt_id=attempt_id)
         self.taker.aborted = True
         self.taker_finished(False)
 
@@ -358,6 +395,9 @@ class JMWalletDaemon(Service):
         """ Top-level service (JMWalletDaemon itself) shutdown.
         """
         self.stopSubServices()
+        if self.maker_penalty_store is not None:
+            self.maker_penalty_store.close()
+            self.maker_penalty_store = None
         super().stopService()
 
     def stopSubServices(self):
@@ -1456,22 +1496,28 @@ class JMWalletDaemon(Service):
                                        str(request_data["txfee"]))
 
             attempt_id = self.make_taker_attempt_id()
-            ignored_makers = self.get_active_stage2_maker_cooldowns()
-            if ignored_makers:
+            active_hard_bans = self.get_active_taker_hard_bans()
+            active_cooldowns = self.get_active_stage2_maker_cooldowns()
+            if active_cooldowns:
                 jlog.info("taker_attempt attempt_id={} active_stage2_"
                           "cooldowns=[{}]".format(
-                              attempt_id, ",".join(ignored_makers)))
+                              attempt_id, ",".join(active_cooldowns)))
+            if active_hard_bans:
+                jlog.info("taker_attempt attempt_id={} active_taker_"
+                          "hard_bans=[{}]".format(
+                              attempt_id, ",".join(active_hard_bans)))
 
             self.taker = Taker(self.services["wallet"], schedule,
                                max_cj_fee = max_cj_fee,
                                callbacks=(self.filter_orders_callback,
                                           None, self.taker_finished),
-                               ignored_makers=ignored_makers,
                                attempt_id=attempt_id,
                                stage2_start_callback=(
                                    self.on_taker_stage2_started),
                                stage2_complete_callback=(
-                                   self.on_taker_stage2_completed))
+                                   self.on_taker_stage2_completed),
+                               hard_excluded_makers=active_hard_bans,
+                               cooldown_makers=active_cooldowns)
             # Keep the generic stallMonitor disabled for this RPC-only taker;
             # stage-2 signature collection is covered by the RPC watchdog
             # above and single-attempt cleanup is handled by taker_finished().

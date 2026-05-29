@@ -161,6 +161,43 @@ def test_single_join_fill_response_failure_finishes_immediately():
     assert client.ignored_makers == ["maker-a", "maker-b"]
     assert calls == [(False, False, 0.0)]
 
+
+def test_single_join_fill_response_failure_can_retry(monkeypatch):
+    calls = []
+
+    class DummyTakerForFillRetry(object):
+        schedule = ["only-attempt"]
+
+        def prepare_maker_selection_retry(self, makers, reason):
+            self.retry_args = (makers, reason)
+            return True
+
+        def add_ignored_makers(self, makers):
+            raise AssertionError("retry path handles failed makers")
+
+        def on_finished_callback(self, *args):
+            calls.append(args)
+
+    scheduled = []
+
+    def fake_call_later(delay, callback, *args):
+        scheduled.append((delay, callback, args))
+        return object()
+
+    monkeypatch.setattr(client_protocol.reactor, "callLater", fake_call_later)
+    client = DummyTakerForFillRetry()
+    proto = object.__new__(JMTakerClientProtocol)
+    proto.client = client
+    proto.get_offers = lambda: None
+
+    response = proto.on_JM_FILL_RESPONSE(False, ["maker-a", "maker-b"])
+
+    assert response == {"accepted": True}
+    assert client.retry_args == (
+        ["maker-a", "maker-b"], "fill_response_failure")
+    assert scheduled == [(0, proto.get_offers, ())]
+    assert calls == []
+
 #class DummyWalletService(object):
 #    wallet = DummyWallet()
 #    def register_callbacks(self, callbacks, unconfirmed=True):
