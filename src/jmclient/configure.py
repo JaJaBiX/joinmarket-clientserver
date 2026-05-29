@@ -69,9 +69,9 @@ global_singleton.nickname = None
 global_singleton.BITCOIN_DUST_THRESHOLD = btc.DUST_THRESHOLD
 global_singleton.DUST_THRESHOLD = 10 * global_singleton.BITCOIN_DUST_THRESHOLD
 global_singleton.bc_interface = None
-global_singleton.maker_timeout_sec = 15
+global_singleton.maker_timeout_sec = 120
 global_singleton.taker_stall_monitor_timeout_seconds = 60
-global_singleton.taker_stage2_sig_timeout_seconds = 60
+global_singleton.taker_stage2_sig_timeout_seconds = 360
 global_singleton.debug_file_handle = None
 global_singleton.core_alert = core_alert
 global_singleton.joinmarket_alert = joinmarket_alert
@@ -216,9 +216,9 @@ console_log_level = INFO
 color = true
 
 [TIMEOUT]
-maker_timeout_sec = 15
+maker_timeout_sec = 120
 taker_stall_monitor_timeout_seconds = 60
-taker_stage2_sig_timeout_seconds = 60
+taker_stage2_sig_timeout_seconds = 360
 unconfirm_timeout_sec = 180
 confirm_timeout_hours = 6
 

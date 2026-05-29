@@ -198,7 +198,7 @@ class SettingsTab(QDialog):
             if section == 'TIMEOUT' and 'maker_timeout_sec' not in [
                     _[0] for _ in pairs
             ]:
-                jm_single().config.set(section, 'maker_timeout_sec', '60')
+                jm_single().config.set(section, 'maker_timeout_sec', '120')
                 pairs = jm_single().config.items(section)
             newSettingsFields = self.getSettingsFields(section,
                                                        [_[0] for _ in pairs])
