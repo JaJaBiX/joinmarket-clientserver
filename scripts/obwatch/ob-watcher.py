@@ -206,7 +206,8 @@ def calculate_fidelity_bond_data(fbonds, blocks, mediantime, interest_rate):
             bond_outpoint_conf_times)
 
 def refresh_fidelity_bond_data_cache(taker, cache_key, visible_key, fbonds,
-                                     blocks, mediantime, interest_rate):
+                                     blocks, mediantime, interest_rate,
+                                     refreshing_key=None):
     started = time.monotonic()
     try:
         result = calculate_fidelity_bond_data(
@@ -217,45 +218,82 @@ def refresh_fidelity_bond_data_cache(taker, cache_key, visible_key, fbonds,
                 "key": cache_key,
                 "visible_key": visible_key,
                 "value": result,
+                "updated_at": time.monotonic(),
             }
     except Exception as e:
         result = ([], [], [])
         log.warning("Failed to refresh fidelity-bond export data: " + repr(e))
     finally:
-        lock = get_fidelity_bond_cache_lock(taker)
-        with lock:
-            if taker._fidelity_bond_data_refreshing_key == cache_key:
-                taker._fidelity_bond_data_refreshing_key = None
+        if refreshing_key is not None:
+            lock = get_fidelity_bond_cache_lock(taker)
+            with lock:
+                if taker._fidelity_bond_data_refreshing_key == refreshing_key:
+                    taker._fidelity_bond_data_refreshing_key = None
     elapsed = time.monotonic() - started
     if elapsed >= 0.25:
         log.info("Refreshed fidelity-bond export data in {:.3f}s "
                  "(visible_bonds={}, valid_bonds={})".format(
                      elapsed, len(fbonds), len(result[0])))
 
-def start_fidelity_bond_data_refresh(taker, cache_key, visible_key, fbonds,
-                                     blocks, mediantime, interest_rate):
+def refresh_fidelity_bond_data_cache_async(taker, visible_key, fbonds,
+                                           interest_rate):
+    try:
+        blocks = jm_single().bc_interface.get_current_block_height()
+        mediantime = jm_single().bc_interface.get_best_block_median_time()
+        cache_key = (blocks, mediantime, interest_rate, visible_key)
+        refresh_fidelity_bond_data_cache(
+            taker, cache_key, visible_key, fbonds, blocks, mediantime,
+            interest_rate, refreshing_key=visible_key)
+    except Exception as e:
+        log.warning("Failed to start fidelity-bond export refresh: " + repr(e))
+        lock = get_fidelity_bond_cache_lock(taker)
+        with lock:
+            if taker._fidelity_bond_data_refreshing_key == visible_key:
+                taker._fidelity_bond_data_refreshing_key = None
+
+def start_fidelity_bond_data_refresh(taker, visible_key, fbonds,
+                                     interest_rate):
     lock = get_fidelity_bond_cache_lock(taker)
     with lock:
-        if taker._fidelity_bond_data_refreshing_key == cache_key:
+        if taker._fidelity_bond_data_refreshing_key == visible_key:
             return
-        taker._fidelity_bond_data_refreshing_key = cache_key
+        taker._fidelity_bond_data_refreshing_key = visible_key
     thread = threading.Thread(
-        target=refresh_fidelity_bond_data_cache,
-        args=(taker, cache_key, visible_key, fbonds, blocks, mediantime,
-              interest_rate),
+        target=refresh_fidelity_bond_data_cache_async,
+        args=(taker, visible_key, fbonds, interest_rate),
         name="FidelityBondDataRefresh")
     thread.daemon = True
     thread.start()
 
 def get_fidelity_bond_data(taker, wait=True):
     fbonds = taker.get_visible_fidelitybond_rows()
-    blocks = jm_single().bc_interface.get_current_block_height()
-    mediantime = jm_single().bc_interface.get_best_block_median_time()
-    interest_rate = get_interest_rate()
     visible_key = tuple((fb["counterparty"], fb["takernick"], fb["proof"])
                         for fb in fbonds)
-    cache_key = (blocks, mediantime, interest_rate, visible_key)
+    interest_rate = get_interest_rate()
     lock = get_fidelity_bond_cache_lock(taker)
+
+    if not wait:
+        cached_value = None
+        refresh_needed = True
+        with lock:
+            cache = taker._fidelity_bond_data_cache
+            if cache and cache.get("visible_key") == visible_key:
+                cached_value = cache["value"]
+                updated_at = cache.get("updated_at", 0)
+                refresh_needed = time.monotonic() - updated_at >= 60
+            if taker._fidelity_bond_data_refreshing_key == visible_key:
+                refresh_needed = False
+
+        if refresh_needed:
+            start_fidelity_bond_data_refresh(
+                taker, visible_key, fbonds, interest_rate)
+        if cached_value is not None:
+            return cached_value
+        return ([], [], [])
+
+    blocks = jm_single().bc_interface.get_current_block_height()
+    mediantime = jm_single().bc_interface.get_best_block_median_time()
+    cache_key = (blocks, mediantime, interest_rate, visible_key)
     with lock:
         cache = taker._fidelity_bond_data_cache
         if cache and cache.get("key") == cache_key:
@@ -270,15 +308,6 @@ def get_fidelity_bond_data(taker, wait=True):
             if cache and cache.get("key") == cache_key:
                 return cache["value"]
         return ([], [], [])
-
-    start_fidelity_bond_data_refresh(
-        taker, cache_key, visible_key, fbonds, blocks, mediantime,
-        interest_rate)
-    with lock:
-        cache = taker._fidelity_bond_data_cache
-        if cache and cache.get("visible_key") == visible_key:
-            return cache["value"]
-    return ([], [], [])
 
 class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
     def __init__(self, request, client_address, base_server):
