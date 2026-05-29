@@ -107,7 +107,7 @@ def test_stage2_watchdog_schedules_and_cancels(monkeypatch, tmp_path):
     daemon.on_taker_stage2_started(taker)
 
     assert calls
-    assert calls[0][0] == 60
+    assert calls[0][0] == daemon.get_taker_stage2_sig_timeout_seconds()
     assert calls[0][1] == daemon.on_taker_stage2_timeout
     assert calls[0][2] == ("rpc-cj-test",)
     assert daemon.taker_stage2_timeout_call is calls[0][3]

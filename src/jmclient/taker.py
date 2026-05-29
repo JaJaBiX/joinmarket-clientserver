@@ -140,6 +140,7 @@ class Taker(object):
         self.nonrespondants = []
 
         self.waiting_for_conf = False
+        self.latest_tx = None
         self.txid = None
         self.schedule_index = -1
         self.utxos = {}
