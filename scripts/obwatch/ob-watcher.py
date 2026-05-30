@@ -43,7 +43,7 @@ if 'matplotlib' in sys.modules:
 
 from jmclient import jm_single, load_program_config, calc_cj_fee, \
      get_mchannels, add_base_options
-from jmdaemon import (OrderbookWatch, MessageChannelCollection,
+from jmdaemon import (OrderbookWatch, RefreshStateStore, MessageChannelCollection,
                       OnionMessageChannel, IRCMessageChannel)
 #TODO this is only for base58, find a solution for a client without jmbitcoin
 import jmbitcoin as btc
@@ -361,6 +361,7 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
         return {"offers": offers, "fidelitybonds": fidelitybonds}
 
     def create_orderbook_sources_obj(self):
+        connected_directories = self.taker.get_connected_directory_locations()
         return {
             "directory_peers": [dict(row)
                                 for row in self.taker.get_directory_peer_rows()],
@@ -370,6 +371,12 @@ class OrderbookPageRequestHeader(http.server.SimpleHTTPRequestHandler):
             "fidelitybond_sources": [
                 dict(row)
                 for row in self.taker.get_fidelitybond_source_rows()],
+            "directory_peers_refresh": [
+                dict(row)
+                for row in self.taker.refresh_state_store.get_rows()],
+            "directory_runtime_liquidity":
+                self.taker.get_directory_runtime_liquidity(
+                    connected_directories),
         }
 
     def create_depth_chart(self, cj_amount, args=None):
@@ -867,71 +874,42 @@ class HTTPDThread(threading.Thread):
 class ObBasic(OrderbookWatch):
     """Dummy orderbook watch class
     with hooks for triggering orderbook request"""
+    @staticmethod
+    def read_int_env(name, default):
+        try:
+            return int(os.environ.get(name, str(default)))
+        except ValueError:
+            log.warning('Invalid {}; using {} seconds.'.format(name, default))
+            return default
+
     def __init__(self, msgchan, hostport):
         self.hostport = hostport
         self.httpd_thread_started = False
         self.orderbook_refresh_thread_started = False
-        self.orderbook_refresh_interval = 900
-        try:
-            self.orderbook_refresh_interval = int(os.environ.get(
-                'JM_OBWATCH_REFRESH_INTERVAL_SECONDS',
-                str(self.orderbook_refresh_interval)))
-        except ValueError:
-            log.warning('Invalid JM_OBWATCH_REFRESH_INTERVAL_SECONDS; '
-                        'using 900 seconds.')
-        self.reconnect_refresh_min_interval = 30
-        try:
-            self.reconnect_refresh_min_interval = int(os.environ.get(
-                'JM_OBWATCH_RECONNECT_REFRESH_MIN_INTERVAL_SECONDS',
-                str(self.reconnect_refresh_min_interval)))
-        except ValueError:
-            log.warning('Invalid '
-                        'JM_OBWATCH_RECONNECT_REFRESH_MIN_INTERVAL_SECONDS; '
-                        'using 30 seconds.')
-        self.last_reconnect_refresh_at = {}
-        self.directory_source_stale_seconds = 900
-        try:
-            self.directory_source_stale_seconds = int(os.environ.get(
-                'JM_OBWATCH_DN_SOURCE_STALE_SECONDS',
-                str(self.directory_source_stale_seconds)))
-        except ValueError:
-            log.warning('Invalid JM_OBWATCH_DN_SOURCE_STALE_SECONDS; '
-                        'using 900 seconds.')
-        self.directory_refresh_response_timeout_seconds = 30
-        try:
-            self.directory_refresh_response_timeout_seconds = int(
-                os.environ.get(
-                    'JM_OBWATCH_DN_REFRESH_RESPONSE_TIMEOUT_SECONDS',
-                    str(self.directory_refresh_response_timeout_seconds)))
-        except ValueError:
-            log.warning('Invalid '
-                        'JM_OBWATCH_DN_REFRESH_RESPONSE_TIMEOUT_SECONDS; '
-                        'using 30 seconds.')
-        self.source_inactive_grace_seconds = 900
-        try:
-            self.source_inactive_grace_seconds = int(os.environ.get(
-                'JM_OBWATCH_SOURCE_INACTIVE_GRACE_SECONDS',
-                str(self.source_inactive_grace_seconds)))
-        except ValueError:
-            log.warning('Invalid JM_OBWATCH_SOURCE_INACTIVE_GRACE_SECONDS; '
-                        'using 900 seconds.')
-        self.orphan_source_retention_seconds = 3600
-        try:
-            self.orphan_source_retention_seconds = int(os.environ.get(
-                'JM_OBWATCH_ORPHAN_SOURCE_RETENTION_SECONDS',
-                str(self.orphan_source_retention_seconds)))
-        except ValueError:
-            log.warning('Invalid '
-                        'JM_OBWATCH_ORPHAN_SOURCE_RETENTION_SECONDS; '
-                        'using 3600 seconds.')
+        self.orderbook_request_interval = self.read_int_env(
+            'JM_OBWATCH_ORDERBOOK_REQUEST_INTERVAL_SECONDS', 360)
+        self.directory_refresh_target_seconds = self.read_int_env(
+            'JM_OBWATCH_DN_REFRESH_TARGET_SECONDS', 900)
+        self.directory_cooldown_seconds = self.read_int_env(
+            'JM_OBWATCH_DN_COOLDOWN_SECONDS', 600)
+        self.offer_ttl_seconds = self.read_int_env(
+            'JM_OBWATCH_OFFER_TTL_SECONDS', 7200)
+        self.fidelitybond_ttl_seconds = self.read_int_env(
+            'JM_OBWATCH_FIDELITYBOND_TTL_SECONDS', 7200)
+        self.source_inactive_grace_seconds = self.read_int_env(
+            'JM_OBWATCH_SOURCE_INACTIVE_GRACE_SECONDS', 900)
+        self.orphan_source_retention_seconds = self.read_int_env(
+            'JM_OBWATCH_ORPHAN_SOURCE_RETENTION_SECONDS', 3600)
+        refresh_db_path = os.environ.get('JM_OBWATCH_REFRESH_DB_PATH')
+        if not refresh_db_path:
+            refresh_db_path = os.path.join(jm_single().datadir or ".",
+                                           "orderbook-refresh.sqlite3")
+        refresh_db_dir = os.path.dirname(os.path.abspath(refresh_db_path))
+        if refresh_db_dir and not os.path.exists(refresh_db_dir):
+            os.makedirs(refresh_db_dir, exist_ok=True)
+        self.refresh_state_store = RefreshStateStore(refresh_db_path)
         self.refresh_run_lock = threading.Lock()
-        self.refresh_state_lock = threading.Lock()
-        self.refresh_tracking = False
-        self.refresh_expected_directory_peers = set()
-        self.refresh_disconnected_directory_peers = set()
-        self.refresh_seen_directory_peers = set()
-        self.pending_refresh_directories = set()
-        self.pending_reconnect_refresh = False
+        self.startup_refresh_initialized = False
         self.set_msgchan(msgchan)
         # in client-server, this is passed by client
         # in INIT message. Here, we have no Joinmarket client,
@@ -941,6 +919,13 @@ class ObBasic(OrderbookWatch):
         # Start HTTP endpoint even if welcome callback never arrives.
         self.start_http_server_once()
         self.start_orderbook_refresh_once()
+        log.info('Orderbook refresh scheduler db={}, interval={}s, '
+                 'target={}s, DN cooldown={}s, offer TTL={}s, '
+                 'fidelity-bond TTL={}s.'.format(
+                     refresh_db_path, self.orderbook_request_interval,
+                     self.directory_refresh_target_seconds,
+                     self.directory_cooldown_seconds, self.offer_ttl_seconds,
+                     self.fidelitybond_ttl_seconds))
 
     def start_http_server_once(self):
         if self.httpd_thread_started:
@@ -950,29 +935,23 @@ class ObBasic(OrderbookWatch):
 
     def on_order_seen(self, counterparty, oid, ordertype, minsize, maxsize,
                       txfee, cjfee, source_directory=None):
-        with self.refresh_state_lock:
-            if self.refresh_tracking and source_directory:
-                self.refresh_seen_directory_peers.add(source_directory)
         super().on_order_seen(counterparty, oid, ordertype, minsize, maxsize,
                               txfee, cjfee, source_directory)
 
     def on_fidelity_bond_seen(self, nick, bond_type,
                               fidelity_bond_proof_msg, source_directory=None):
-        with self.refresh_state_lock:
-            if self.refresh_tracking and source_directory:
-                self.refresh_seen_directory_peers.add(source_directory)
         super().on_fidelity_bond_seen(nick, bond_type,
                                       fidelity_bond_proof_msg,
                                       source_directory)
 
     def on_message_seen(self, mc, msgtype, nick, message,
                         source_directory=None):
-        with self.refresh_state_lock:
-            if self.refresh_tracking and source_directory and \
-                    source_directory in self.refresh_expected_directory_peers:
-                self.refresh_seen_directory_peers.add(source_directory)
         super().on_message_seen(mc, msgtype, nick, message,
                                 source_directory)
+
+    def on_valid_orderbook_response(self, source_directory, response_type):
+        self.refresh_state_store.record_response(
+            source_directory, response_type)
 
     def on_directory_peer_disconnected(self, peer):
         try:
@@ -981,16 +960,11 @@ class ObBasic(OrderbookWatch):
             peer_location = 'unknown'
         if peer_location != 'unknown':
             self.record_directory_disconnected(peer_location)
-        with self.refresh_state_lock:
-            if self.refresh_tracking and \
-                    peer_location in self.refresh_expected_directory_peers:
-                self.refresh_disconnected_directory_peers.add(peer_location)
-        log.info('Directory peer {} disconnected during orderbook '
-                 'tracking.'.format(peer_location))
+            self.refresh_state_store.mark_disconnected(peer_location)
+        log.info('Directory peer {} disconnected.'.format(peer_location))
 
     def on_disconnect(self):
         offers, fbonds = self.get_orderbook_counts()
-        self.pending_reconnect_refresh = True
         log.warning('Message channel disconnected; preserving current '
                     'orderbook view ({} offers, {} fidelity bonds) '
                     'until a directory reconnect refresh succeeds.'.format(
@@ -1013,163 +987,86 @@ class ObBasic(OrderbookWatch):
                               repr(e))
         return connected_locations
 
-    def begin_refresh_tracking(self, expected_directory_peers):
-        with self.refresh_state_lock:
-            self.refresh_tracking = True
-            self.refresh_expected_directory_peers = set(
-                expected_directory_peers)
-            self.refresh_disconnected_directory_peers = set()
-            self.refresh_seen_directory_peers = set()
-
-    def get_refresh_tracking_state(self):
-        with self.refresh_state_lock:
-            return {
-                'directory_peers': set(self.refresh_seen_directory_peers),
-                'disconnected_directory_peers':
-                    set(self.refresh_disconnected_directory_peers),
-            }
-
-    def end_refresh_tracking(self):
-        with self.refresh_state_lock:
-            self.refresh_tracking = False
-            self.refresh_expected_directory_peers = set()
-            self.refresh_disconnected_directory_peers = set()
-            self.refresh_seen_directory_peers = set()
-
     def make_refresh_id(self, reason):
         normalized_reason = reason.replace(' ', '-')
         return '{}-{}'.format(normalized_reason[:40], uuid.uuid4().hex)
 
-    def get_directory_refresh_metadata(self):
-        with self.dblock:
-            rows = self.db.execute('SELECT * FROM directory_peers;').fetchall()
-        return {row['directory']: dict(row) for row in rows}
-
-    def get_stale_directory_locations(self, candidate_directories=None):
+    def initialize_startup_refresh_state(self):
+        if self.startup_refresh_initialized:
+            return
         connected_directories = self.get_connected_directory_locations()
-        if candidate_directories is not None:
-            connected_directories &= set(candidate_directories)
-        if self.directory_source_stale_seconds <= 0:
-            return connected_directories
         now = int(time.time())
-        metadata = self.get_directory_refresh_metadata()
-        stale_directories = set()
-        for directory in connected_directories:
-            row = metadata.get(directory, {})
-            last_response = row.get('last_orderbook_response_at') or \
-                row.get('last_seen_at') or row.get('last_successful_refresh_at')
-            if last_response is None or \
-                    now - int(last_response) >= \
-                    self.directory_source_stale_seconds:
-                stale_directories.add(directory)
-        return stale_directories
+        self.refresh_state_store.mark_due_connected_directories(
+            connected_directories, self.directory_refresh_target_seconds, now,
+            reset_fresh=True)
+        self.startup_refresh_initialized = True
+        log.info('Initialized orderbook refresh state for {} connected '
+                 'directory peers.'.format(len(connected_directories)))
 
-    def selective_refresh_orderbook(self, reason, candidate_directories=None,
-                                    force=False):
+    def refresh_orderbook_once(self, reason):
         if not self.refresh_run_lock.acquire(False):
             log.info('Skipping {} orderbook refresh; another refresh is '
                      'already in progress.'.format(reason))
-            if candidate_directories:
-                with self.refresh_state_lock:
-                    self.pending_refresh_directories.update(
-                        candidate_directories)
-                self.pending_reconnect_refresh = True
             return False
         before_offers, before_fbonds = self.get_orderbook_counts()
-        refresh_id = self.make_refresh_id(reason)
-        pending_directories = set()
         try:
+            self.initialize_startup_refresh_state()
             connected_directories = self.get_connected_directory_locations()
-            if candidate_directories is not None:
-                connected_directories &= set(candidate_directories)
             if not connected_directories:
-                self.pending_reconnect_refresh = True
                 log.warning('Skipping {} orderbook refresh; no connected '
-                            'candidate directory peers are available.'.format(
-                                reason))
+                            'directory peers are available.'.format(reason))
                 return False
-            target_directories = connected_directories if force else \
-                self.get_stale_directory_locations(candidate_directories)
-            if not target_directories:
-                log.info('Skipping {} orderbook refresh; all candidate '
-                         'directory sources are fresh.'.format(reason))
+            now = int(time.time())
+            self.refresh_state_store.mark_due_connected_directories(
+                connected_directories, self.directory_refresh_target_seconds,
+                now)
+            runtime_liquidity = self.get_directory_runtime_liquidity(
+                connected_directories)
+            selected = self.refresh_state_store.select_next_refresh(
+                runtime_liquidity, now)
+            self.prune_stale_sources(
+                self.offer_ttl_seconds, self.fidelitybond_ttl_seconds, now)
+            if not selected:
+                log.info('Skipping {} orderbook refresh; no connected '
+                         'directory peer is due after cooldown.'.format(
+                             reason))
                 return True
-            self.begin_refresh_tracking(target_directories)
-            self.set_current_refresh_id(refresh_id)
-            log.info('Starting {} selective orderbook refresh for {} '
-                     'directory peers with current view of {} offers, {} '
-                     'fidelity bonds.'.format(
-                         reason, len(target_directories), before_offers,
-                         before_fbonds))
-            sent_directories = set()
-            for directory in sorted(target_directories):
-                self.record_orderbook_request(directory, refresh_id)
-                try:
-                    if self.request_orderbook_from_directory(directory):
-                        sent_directories.add(directory)
-                    else:
-                        log.warning('Failed to send targeted orderbook '
-                                    'request to directory {}.'.format(
-                                        directory))
-                except Exception as e:
-                    log.warning('Failed to send targeted orderbook request '
-                                'to directory {}: {}'.format(
-                                    directory, repr(e)))
-            if not sent_directories:
-                self.pending_reconnect_refresh = True
-                return False
-
-            time.sleep(max(
-                0, self.directory_refresh_response_timeout_seconds))
-            tracking_state = self.get_refresh_tracking_state()
-            disconnected_directories = \
-                tracking_state['disconnected_directory_peers']
-            disconnected_directories |= (
-                sent_directories - self.get_connected_directory_locations())
-            responded_directories = (
-                tracking_state['directory_peers'] & sent_directories)
-
-            if disconnected_directories:
-                log.warning('{} orderbook refresh saw directory disconnects: '
-                            '{}.'.format(
-                                reason,
-                                ','.join(sorted(disconnected_directories))))
-
-            if responded_directories:
-                self.prune_unseen_sources_for_directories(
-                    responded_directories, refresh_id)
-                for directory in responded_directories:
-                    self.record_successful_refresh(directory, refresh_id)
-
-            missing_directories = sent_directories - responded_directories
-            self.pending_reconnect_refresh = bool(missing_directories)
-            self.prune_sources()
-            after_offers, after_fbonds = self.get_orderbook_counts()
-            log.info('Completed {} selective orderbook refresh: {} '
-                     'directories responded, {} missing; current view '
-                     'has {} offers, {} fidelity bonds.'.format(
-                         reason, len(responded_directories),
-                         len(missing_directories), after_offers,
-                         after_fbonds))
-            return not missing_directories
+            directory = selected["directory"]
+            refresh_id = self.make_refresh_id(reason)
+            self.record_orderbook_request(directory, refresh_id)
+            self.refresh_state_store.record_request(
+                directory, refresh_id, self.directory_cooldown_seconds, now)
+            log.info('Sending {} orderbook refresh to {} '
+                     '(runtime offers={}, fidelity bonds={}, missing={}, '
+                     'current view offers={}, fidelity bonds={}).'.format(
+                         reason, directory,
+                         selected.get("orderbook_size", 0),
+                         selected.get("fidelitybond_size", 0),
+                         selected.get("consecutive_missing_count", 0),
+                         before_offers, before_fbonds))
+            try:
+                if self.request_orderbook_from_directory(directory):
+                    return True
+                log.warning('Failed to send targeted orderbook request to '
+                            'directory {}.'.format(directory))
+            except Exception as e:
+                log.warning('Failed to send targeted orderbook request to '
+                            'directory {}: {}'.format(directory, repr(e)))
+            self.refresh_state_store.record_request_send_failure(directory)
+            return False
         finally:
-            self.set_current_refresh_id(None)
-            self.end_refresh_tracking()
             self.refresh_run_lock.release()
-            with self.refresh_state_lock:
-                pending_directories = set(self.pending_refresh_directories)
-                self.pending_refresh_directories = set()
-            if pending_directories:
-                self.start_reconnect_orderbook_refresh(
-                    'queued directory peer refresh', pending_directories)
 
     def refresh_orderbook_from_connected_directories(self, reason):
-        return self.selective_refresh_orderbook(
-            reason, self.get_connected_directory_locations(), force=True)
+        connected_directories = self.get_connected_directory_locations()
+        self.refresh_state_store.mark_need_refresh(connected_directories)
+        return self.refresh_orderbook_once(reason)
 
     def start_reconnect_orderbook_refresh(self, reason, target_directories):
-        threading.Thread(target=self.selective_refresh_orderbook,
-                         args=(reason, target_directories, True),
+        if target_directories:
+            self.refresh_state_store.mark_need_refresh(target_directories)
+        threading.Thread(target=self.refresh_orderbook_once,
+                         args=(reason,),
                          name='ReconnectOrderbookRefreshThread',
                          daemon=True).start()
 
@@ -1184,50 +1081,41 @@ class ObBasic(OrderbookWatch):
                     self.on_directory_peer_disconnected
 
     def on_directory_peer_connected(self, peer):
-        if self.reconnect_refresh_min_interval < 0:
-            return
         try:
             peer_location = peer.peer_location()
         except Exception:
             peer_location = 'unknown'
-        if peer_location != 'unknown':
-            self.record_directory_connected(peer_location)
-        now = time.monotonic()
-        if self.reconnect_refresh_min_interval and \
-                peer_location != 'unknown' and \
-                now - self.last_reconnect_refresh_at.get(
-                    peer_location, 0) < \
-                self.reconnect_refresh_min_interval:
-            log.info('Skipping directory reconnect orderbook refresh for {}; '
-                     'previous refresh was recent.'.format(peer_location))
+        if peer_location == 'unknown':
             return
-        if peer_location != 'unknown':
-            self.last_reconnect_refresh_at[peer_location] = now
-        log.info('Directory peer {} connected; requesting targeted '
-                 'orderbook refresh.'.format(peer_location))
-        self.start_reconnect_orderbook_refresh(
-            'directory peer {} connected'.format(peer_location),
-            {peer_location} if peer_location != 'unknown' else None)
+        self.record_directory_connected(peer_location)
+        self.refresh_state_store.mark_connected(
+            peer_location,
+            mark_need_refresh=self.startup_refresh_initialized)
+        if self.startup_refresh_initialized:
+            log.info('Directory peer {} connected; marked for paced '
+                     'orderbook refresh.'.format(peer_location))
+        else:
+            log.info('Directory peer {} connected before startup refresh '
+                     'state was initialized.'.format(peer_location))
 
     def start_orderbook_refresh_once(self):
         if self.orderbook_refresh_thread_started:
             return
-        if self.orderbook_refresh_interval <= 0:
+        if self.orderbook_request_interval <= 0:
             log.info('Periodic orderbook refresh disabled.')
             return
         threading.Thread(target=self.periodic_orderbook_refresh,
                          name='OrderbookRefreshThread',
                          daemon=True).start()
         self.orderbook_refresh_thread_started = True
-        log.info('Periodic orderbook refresh every {} seconds.'.format(
-            self.orderbook_refresh_interval))
+        log.info('Paced orderbook refresh every {} seconds.'.format(
+            self.orderbook_request_interval))
 
     def periodic_orderbook_refresh(self):
         while True:
-            time.sleep(self.orderbook_refresh_interval)
+            time.sleep(self.orderbook_request_interval)
             try:
-                log.info('Requesting periodic selective orderbook refresh.')
-                self.selective_refresh_orderbook('periodic')
+                self.refresh_orderbook_once('periodic')
             except Exception as e:
                 log.warning('Periodic orderbook refresh failed: ' + repr(e))
 
@@ -1237,11 +1125,15 @@ class ObBasic(OrderbookWatch):
         a twisted http server here instead
         of a thread."""
         self.start_http_server_once()
-        self.start_reconnect_orderbook_refresh(
-            'startup', self.get_connected_directory_locations())
+        self.initialize_startup_refresh_state()
+        threading.Thread(target=self.refresh_orderbook_once,
+                         args=('startup',),
+                         name='StartupOrderbookRefreshThread',
+                         daemon=True).start()
 
     def request_orderbook(self):
-        self.msgchan.request_orderbook()
+        self.refresh_orderbook_from_connected_directories(
+            'broadcast compatibility request')
 
     def request_orderbook_from_directory(self, directory_location):
         if hasattr(self.msgchan, 'request_orderbook_from_directory'):

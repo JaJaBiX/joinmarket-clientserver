@@ -546,10 +546,6 @@ class JMDaemonServerProtocol(amp.AMP, OrderbookWatch):
             return
 
         self.record_directory_connected(peer_location)
-        refresh_id = "directory-connect"
-        self.record_orderbook_request(peer_location, refresh_id)
-        if hasattr(self.mcc, "request_orderbook_from_directory"):
-            self.mcc.request_orderbook_from_directory(peer_location)
 
         if self.role == "MAKER" and self.offerlist and \
                 hasattr(self.mcc, "announce_orders_to_directory"):

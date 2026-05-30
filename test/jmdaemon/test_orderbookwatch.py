@@ -1,6 +1,6 @@
 import pytest
 
-from jmdaemon.orderbookwatch import OrderbookWatch
+from jmdaemon.orderbookwatch import OrderbookWatch, RefreshStateStore
 from jmdaemon import IRCMessageChannel, fidelity_bond_cmd_list
 from jmclient import get_mchannels, load_test_config
 from jmdaemon.protocol import JM_VERSION, ORDER_KEYS
@@ -38,6 +38,63 @@ def get_ob():
 def get_direct_visible_orderbook_rows(ob):
     return [dict(row) for row in
             ob.db.execute('SELECT * FROM visible_orderbook;').fetchall()]
+
+def test_refresh_state_store_selects_due_dn_by_runtime_liquidity(tmp_path):
+    store = RefreshStateStore(str(tmp_path / "refresh.sqlite3"))
+    try:
+        now = 1000
+        store.mark_due_connected_directories(
+            ["dn-small.onion:5222", "dn-large.onion:5222"], 900, now)
+        selected = store.select_next_refresh([
+            {"directory": "dn-small.onion:5222", "orderbook_size": 2,
+             "fidelitybond_size": 0},
+            {"directory": "dn-large.onion:5222", "orderbook_size": 5,
+             "fidelitybond_size": 1},
+        ], now)
+        assert selected["directory"] == "dn-large.onion:5222"
+
+        store.record_request("dn-large.onion:5222", "refresh-large", 600, now)
+        selected = store.select_next_refresh([
+            {"directory": "dn-small.onion:5222", "orderbook_size": 2,
+             "fidelitybond_size": 0},
+            {"directory": "dn-large.onion:5222", "orderbook_size": 5,
+             "fidelitybond_size": 1},
+        ], now + 10)
+        assert selected["directory"] == "dn-small.onion:5222"
+
+        store.record_response("dn-large.onion:5222", "offer", now + 20)
+        row = [r for r in store.get_rows()
+               if r["directory"] == "dn-large.onion:5222"][0]
+        assert row["last_successful_refresh_at"] == now + 20
+        assert row["current_generation_offer_count"] == 1
+        assert row["consecutive_missing_count"] == 0
+    finally:
+        store.close()
+
+def test_refresh_state_store_accounts_missing_generation_once(tmp_path):
+    store = RefreshStateStore(str(tmp_path / "refresh.sqlite3"))
+    try:
+        store.mark_due_connected_directories(["dn-missing.onion:5222"],
+                                             900, 100)
+        store.record_request("dn-missing.onion:5222", "refresh-1", 0, 100)
+        store.record_request("dn-missing.onion:5222", "refresh-2", 0, 200)
+        row = store.get_rows()[0]
+        assert row["consecutive_missing_count"] == 1
+
+        store.record_request_send_failure("dn-missing.onion:5222", 201)
+        row = store.get_rows()[0]
+        assert row["consecutive_missing_count"] == 2
+
+        store.record_request("dn-missing.onion:5222", "refresh-3", 0, 300)
+        row = store.get_rows()[0]
+        assert row["consecutive_missing_count"] == 2
+
+        store.record_response("dn-missing.onion:5222", "fidelitybond", 301)
+        row = store.get_rows()[0]
+        assert row["consecutive_missing_count"] == 0
+        assert row["current_generation_fidelitybond_count"] == 1
+    finally:
+        store.close()
 
 @pytest.mark.parametrize(
     "badtopic",
@@ -102,7 +159,7 @@ def test_order_seen_cancel(counterparty, oid, ordertype, minsize, maxsize, txfee
         orderbook = [dict([(k, o[k]) for k in ORDER_KEYS]) for o in rows]
         assert len(orderbook) == 0
 
-def test_order_sources_are_pruned_per_directory():
+def test_order_sources_track_directory_cancel_and_ttl_prune():
     ob = get_ob()
     offer = ("J5SourceMaker", "0", "reloffer", "3000", "4000", "2", "0.3")
     ob.on_order_seen(*offer, source_directory="dn1.onion:5222")
@@ -133,6 +190,14 @@ def test_order_sources_are_pruned_per_directory():
     ob.on_order_seen(*offer, source_directory="dn2.onion:5222")
     ob.prune_unseen_sources_for_directories(["dn2.onion:5222"], "refresh-2")
     rows = ob.db.execute('SELECT * FROM orderbook;').fetchall()
+    assert len(rows) == 1
+
+    ob.db.execute(
+        'UPDATE orderbook_sources SET last_seen_at=? WHERE directory=?;',
+        (1, "dn2.onion:5222"))
+    ob.prune_stale_sources(offer_ttl_seconds=10,
+                            fidelitybond_ttl_seconds=10, now=100)
+    rows = ob.db.execute('SELECT * FROM orderbook;').fetchall()
     assert len(rows) == 0
     source_rows = ob.db.execute(
         'SELECT * FROM orderbook_sources;').fetchall()
@@ -153,7 +218,12 @@ def test_late_order_reactivates_with_directory_refresh_generation():
         'INSERT INTO orderbook_sources VALUES(?, ?, ?, ?, ?, ?, ?, ?);',
         (maker, "0", directory, 1, 1, "refresh-0", 1, None))
 
-    ob.prune_unseen_sources_for_directories([directory], "refresh-1")
+    ob.db.execute(
+        'UPDATE orderbook_sources SET last_seen_at=? WHERE counterparty=? '
+        'AND oid=? AND directory=?;',
+        (1, maker, "0", directory))
+    ob.prune_stale_sources(offer_ttl_seconds=10,
+                            fidelitybond_ttl_seconds=10, now=100)
     source_row = ob.db.execute(
         'SELECT * FROM orderbook_sources WHERE counterparty=? AND oid=? '
         'AND directory=?;',
@@ -203,6 +273,71 @@ def test_source_from_other_directory_keeps_its_own_generation():
         'AND directory=?;',
         (maker, "0", directory_b)).fetchone()
     assert source_row["last_refresh_id"] == "refresh-b"
+
+def test_offer_seen_refreshes_existing_active_sources_only():
+    ob = get_ob()
+    directory_a = "dn-active-a.onion:5222"
+    directory_b = "dn-active-b.onion:5222"
+    directory_c = "dn-inactive-c.onion:5222"
+    maker = "J5ActiveSourceMaker"
+    offer = (maker, "0", "reloffer", "3000", "4000", "2", "0.3")
+
+    ob.record_orderbook_request(directory_a, "refresh-a")
+    ob.record_orderbook_request(directory_b, "refresh-b")
+    ob.record_orderbook_request(directory_c, "refresh-c")
+    ob.on_order_seen(*offer, source_directory=directory_a)
+    ob.on_order_seen(*offer, source_directory=directory_c)
+    ob.on_order_cancel(maker, "0", source_directory=directory_c)
+    inactive_before = ob.db.execute(
+        'SELECT last_seen_at FROM orderbook_sources WHERE counterparty=? '
+        'AND oid=? AND directory=?;',
+        (maker, "0", directory_c)).fetchone()["last_seen_at"]
+
+    ob.on_order_seen(*offer, source_directory=directory_b)
+
+    source_rows = ob.db.execute(
+        'SELECT * FROM orderbook_sources WHERE counterparty=? AND oid=? '
+        'ORDER BY directory;',
+        (maker, "0")).fetchall()
+    rows_by_directory = {row["directory"]: row for row in source_rows}
+    assert rows_by_directory[directory_a]["active"] == 1
+    assert rows_by_directory[directory_a]["last_refresh_id"] == "refresh-a"
+    assert rows_by_directory[directory_b]["active"] == 1
+    assert rows_by_directory[directory_b]["last_refresh_id"] == "refresh-b"
+    assert rows_by_directory[directory_c]["active"] == 0
+    assert rows_by_directory[directory_c]["last_seen_at"] == inactive_before
+
+def test_fidelitybond_source_refreshes_existing_active_sources_only():
+    ob = get_ob()
+    maker = "J5ActiveBondMaker"
+    directory_a = "dn-bond-a.onion:5222"
+    directory_b = "dn-bond-b.onion:5222"
+    directory_c = "dn-bond-c.onion:5222"
+
+    ob.record_orderbook_request(directory_a, "refresh-a")
+    ob.record_orderbook_request(directory_b, "refresh-b")
+    ob.record_orderbook_request(directory_c, "refresh-c")
+    try:
+        ob.dblock.acquire(True)
+        ob._upsert_fidelitybond_source_locked(maker, directory_a, 10)
+        ob._upsert_fidelitybond_source_locked(maker, directory_c, 10)
+        ob._deactivate_fidelitybond_source_locked(maker, directory_c, 20)
+        ob._upsert_fidelitybond_source_locked(maker, directory_b, 30)
+    finally:
+        ob.dblock.release()
+
+    source_rows = ob.db.execute(
+        'SELECT * FROM fidelitybond_sources WHERE counterparty=? '
+        'ORDER BY directory;',
+        (maker,)).fetchall()
+    rows_by_directory = {row["directory"]: row for row in source_rows}
+    assert rows_by_directory[directory_a]["active"] == 1
+    assert rows_by_directory[directory_a]["last_seen_at"] == 30
+    assert rows_by_directory[directory_a]["last_refresh_id"] == "refresh-a"
+    assert rows_by_directory[directory_b]["active"] == 1
+    assert rows_by_directory[directory_b]["last_refresh_id"] == "refresh-b"
+    assert rows_by_directory[directory_c]["active"] == 0
+    assert rows_by_directory[directory_c]["last_seen_at"] == 10
 
 def test_source_upserts_assign_initial_non_null_refresh_ids():
     ob = get_ob()

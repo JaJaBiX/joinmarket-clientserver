@@ -7,7 +7,7 @@ from .irc import IRCMessageChannel
 from .onionmc import OnionMessageChannel
 from jmbase.support import get_log
 from .message_channel import MessageChannel, MessageChannelCollection
-from .orderbookwatch import OrderbookWatch
+from .orderbookwatch import OrderbookWatch, RefreshStateStore
 from jmbase import commands
 from .daemon_protocol import (JMDaemonServerProtocolFactory, JMDaemonServerProtocol,
                               start_daemon, SNICKERDaemonServerProtocolFactory,
@@ -25,4 +25,3 @@ except ImportError: #pragma: no cover
             pass
 
 logging.getLogger(__name__).addHandler(NullHandler())
-

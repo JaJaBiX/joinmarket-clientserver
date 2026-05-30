@@ -17,6 +17,288 @@ log = get_log()
 class JMTakerError(Exception):
     pass
 
+
+class RefreshStateStore(object):
+    """File-backed state for paced directory-node orderbook refreshes."""
+
+    def __init__(self, db_path, busy_timeout_ms=5000):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self.con = sqlite3.connect(db_path, check_same_thread=False,
+                                   isolation_level=None)
+        self.con.row_factory = dict_factory
+        self.con.execute("PRAGMA busy_timeout={};".format(
+            int(busy_timeout_ms)))
+        self.con.execute("PRAGMA journal_mode=WAL;")
+        self.con.execute("PRAGMA synchronous=NORMAL;")
+        self._migrate()
+
+    def close(self):
+        with self.lock:
+            self.con.close()
+
+    def _migrate(self):
+        with self.lock:
+            self.con.execute("BEGIN IMMEDIATE;")
+            try:
+                self.con.execute(
+                    "CREATE TABLE IF NOT EXISTS directory_peers_refresh("
+                    "directory TEXT PRIMARY KEY, "
+                    "need_refresh INTEGER NOT NULL DEFAULT 1, "
+                    "cooldown_time INTEGER NOT NULL DEFAULT 0, "
+                    "current_refresh_id TEXT, "
+                    "current_generation_offer_count INTEGER NOT NULL "
+                    "DEFAULT 0, "
+                    "current_generation_fidelitybond_count INTEGER NOT NULL "
+                    "DEFAULT 0, "
+                    "last_request_at INTEGER, "
+                    "last_response_at INTEGER, "
+                    "last_successful_refresh_at INTEGER, "
+                    "last_connected_at INTEGER, "
+                    "last_disconnected_at INTEGER, "
+                    "request_count INTEGER NOT NULL DEFAULT 0, "
+                    "response_count INTEGER NOT NULL DEFAULT 0, "
+                    "consecutive_missing_count INTEGER NOT NULL DEFAULT 0, "
+                    "last_missing_accounted_request_at INTEGER, "
+                    "updated_at INTEGER);")
+                self.con.execute(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "directory_peers_refresh_due "
+                    "ON directory_peers_refresh(need_refresh, "
+                    "cooldown_time);")
+                self.con.execute("COMMIT;")
+            except Exception:
+                self.con.execute("ROLLBACK;")
+                raise
+
+    @staticmethod
+    def _now():
+        return int(time.time())
+
+    def _ensure_directory_locked(self, directory, now):
+        self.con.execute(
+            "INSERT OR IGNORE INTO directory_peers_refresh"
+            "(directory, updated_at) VALUES(?, ?);",
+            (directory, now))
+
+    def mark_connected(self, directory, mark_need_refresh=False, now=None):
+        if not directory:
+            return
+        now = self._now() if now is None else now
+        with self.lock:
+            self.con.execute("BEGIN IMMEDIATE;")
+            try:
+                self._ensure_directory_locked(directory, now)
+                assignments = ["last_connected_at=?", "updated_at=?"]
+                values = [now, now]
+                if mark_need_refresh:
+                    assignments.append("need_refresh=1")
+                self.con.execute(
+                    "UPDATE directory_peers_refresh SET " +
+                    ", ".join(assignments) + " WHERE directory=?;",
+                    values + [directory])
+                self.con.execute("COMMIT;")
+            except Exception:
+                self.con.execute("ROLLBACK;")
+                raise
+
+    def mark_disconnected(self, directory, now=None):
+        if not directory:
+            return
+        now = self._now() if now is None else now
+        with self.lock:
+            self.con.execute("BEGIN IMMEDIATE;")
+            try:
+                self._ensure_directory_locked(directory, now)
+                self.con.execute(
+                    "UPDATE directory_peers_refresh SET "
+                    "last_disconnected_at=?, updated_at=? "
+                    "WHERE directory=?;",
+                    (now, now, directory))
+                self.con.execute("COMMIT;")
+            except Exception:
+                self.con.execute("ROLLBACK;")
+                raise
+
+    def mark_due_connected_directories(self, directories, target_seconds,
+                                       now=None, reset_fresh=False):
+        now = self._now() if now is None else now
+        directories = [d for d in directories if d]
+        if not directories:
+            return
+        fresh_value = "0" if reset_fresh else "need_refresh"
+        with self.lock:
+            self.con.execute("BEGIN IMMEDIATE;")
+            try:
+                for directory in directories:
+                    self._ensure_directory_locked(directory, now)
+                    self.con.execute(
+                        "UPDATE directory_peers_refresh SET "
+                        "last_connected_at=COALESCE(last_connected_at, ?), "
+                        "need_refresh=CASE "
+                        "WHEN last_successful_refresh_at IS NULL THEN 1 "
+                        "WHEN ? - last_successful_refresh_at > ? THEN 1 "
+                        "ELSE " + fresh_value + " END, "
+                        "updated_at=? WHERE directory=?;",
+                        (now, now, int(target_seconds), now, directory))
+                self.con.execute("COMMIT;")
+            except Exception:
+                self.con.execute("ROLLBACK;")
+                raise
+
+    def mark_need_refresh(self, directories, now=None):
+        now = self._now() if now is None else now
+        directories = [d for d in directories if d]
+        if not directories:
+            return
+        with self.lock:
+            self.con.execute("BEGIN IMMEDIATE;")
+            try:
+                for directory in directories:
+                    self._ensure_directory_locked(directory, now)
+                    self.con.execute(
+                        "UPDATE directory_peers_refresh SET need_refresh=1, "
+                        "updated_at=? WHERE directory=?;",
+                        (now, directory))
+                self.con.execute("COMMIT;")
+            except Exception:
+                self.con.execute("ROLLBACK;")
+                raise
+
+    def _account_missing_generation_locked(self, directory, now):
+        cur = self.con.execute(
+            "SELECT last_request_at, current_generation_offer_count, "
+            "current_generation_fidelitybond_count, "
+            "last_missing_accounted_request_at "
+            "FROM directory_peers_refresh WHERE directory=?;",
+            (directory,))
+        row = cur.fetchone()
+        if not row or row["last_request_at"] is None:
+            return
+        if row["last_missing_accounted_request_at"] == row["last_request_at"]:
+            return
+        total = int(row["current_generation_offer_count"] or 0) + \
+            int(row["current_generation_fidelitybond_count"] or 0)
+        if total != 0:
+            return
+        self.con.execute(
+            "UPDATE directory_peers_refresh SET "
+            "consecutive_missing_count=consecutive_missing_count + 1, "
+            "last_missing_accounted_request_at=last_request_at, "
+            "updated_at=? WHERE directory=?;",
+            (now, directory))
+
+    def record_request(self, directory, refresh_id, cooldown_seconds, now=None):
+        now = self._now() if now is None else now
+        with self.lock:
+            self.con.execute("BEGIN IMMEDIATE;")
+            try:
+                self._ensure_directory_locked(directory, now)
+                self._account_missing_generation_locked(directory, now)
+                self.con.execute(
+                    "UPDATE directory_peers_refresh SET "
+                    "need_refresh=0, cooldown_time=?, "
+                    "current_refresh_id=?, "
+                    "current_generation_offer_count=0, "
+                    "current_generation_fidelitybond_count=0, "
+                    "last_request_at=?, "
+                    "request_count=request_count + 1, "
+                    "updated_at=? WHERE directory=?;",
+                    (now + int(cooldown_seconds), refresh_id, now, now,
+                     directory))
+                self.con.execute("COMMIT;")
+            except Exception:
+                self.con.execute("ROLLBACK;")
+                raise
+
+    def record_request_send_failure(self, directory, now=None):
+        now = self._now() if now is None else now
+        with self.lock:
+            self.con.execute("BEGIN IMMEDIATE;")
+            try:
+                self._ensure_directory_locked(directory, now)
+                self._account_missing_generation_locked(directory, now)
+                self.con.execute(
+                    "UPDATE directory_peers_refresh SET need_refresh=1, "
+                    "updated_at=? WHERE directory=?;",
+                    (now, directory))
+                self.con.execute("COMMIT;")
+            except Exception:
+                self.con.execute("ROLLBACK;")
+                raise
+
+    def record_response(self, directory, response_type, now=None):
+        if not directory:
+            return
+        now = self._now() if now is None else now
+        offer_increment = 1 if response_type == "offer" else 0
+        fidelitybond_increment = 1 if response_type == "fidelitybond" else 0
+        with self.lock:
+            self.con.execute("BEGIN IMMEDIATE;")
+            try:
+                self._ensure_directory_locked(directory, now)
+                self.con.execute(
+                    "UPDATE directory_peers_refresh SET "
+                    "last_response_at=?, "
+                    "last_successful_refresh_at=?, "
+                    "need_refresh=0, "
+                    "current_generation_offer_count="
+                    "current_generation_offer_count + ?, "
+                    "current_generation_fidelitybond_count="
+                    "current_generation_fidelitybond_count + ?, "
+                    "response_count=response_count + 1, "
+                    "consecutive_missing_count=0, "
+                    "last_missing_accounted_request_at=NULL, "
+                    "updated_at=? WHERE directory=?;",
+                    (now, now, offer_increment, fidelitybond_increment, now,
+                     directory))
+                self.con.execute("COMMIT;")
+            except Exception:
+                self.con.execute("ROLLBACK;")
+                raise
+
+    def select_next_refresh(self, runtime_liquidity, now=None):
+        now = self._now() if now is None else now
+        runtime_liquidity = [row for row in runtime_liquidity
+                             if row.get("directory")]
+        if not runtime_liquidity:
+            return None
+        values_sql = ",".join(["(?, ?, ?)"] * len(runtime_liquidity))
+        params = []
+        for row in runtime_liquidity:
+            params.extend([
+                row["directory"],
+                int(row.get("orderbook_size", 0) or 0),
+                int(row.get("fidelitybond_size", 0) or 0),
+            ])
+        params.append(now)
+        sql = (
+            "WITH runtime(directory, orderbook_size, fidelitybond_size) "
+            "AS (VALUES " + values_sql + ") "
+            "SELECT dpr.*, runtime.orderbook_size, "
+            "runtime.fidelitybond_size "
+            "FROM directory_peers_refresh AS dpr "
+            "JOIN runtime ON runtime.directory = dpr.directory "
+            "WHERE dpr.need_refresh = 1 "
+            "AND COALESCE(dpr.cooldown_time, 0) < ? "
+            "ORDER BY COALESCE(dpr.consecutive_missing_count, 0) ASC, "
+            "runtime.orderbook_size DESC, "
+            "runtime.fidelitybond_size DESC, "
+            "COALESCE(dpr.last_request_at, 0) ASC, "
+            "dpr.directory ASC LIMIT 1;")
+        with self.lock:
+            cur = self.con.execute(sql, params)
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_rows(self):
+        with self.lock:
+            cur = self.con.execute(
+                "SELECT * FROM directory_peers_refresh "
+                "ORDER BY directory;")
+            return cur.fetchall()
+
+
 class OrderbookWatch(object):
 
     def set_msgchan(self, msgchan):
@@ -84,6 +366,8 @@ class OrderbookWatch(object):
             self.db.execute("CREATE INDEX orderbook_sources_directory_refresh "
                             "ON orderbook_sources(directory, active, "
                             "last_refresh_id);")
+            self.db.execute("CREATE INDEX orderbook_sources_active_last_seen "
+                            "ON orderbook_sources(active, last_seen_at);")
             self.db.execute("CREATE INDEX "
                             "fidelitybond_sources_directory_active_key "
                             "ON fidelitybond_sources(directory, active, "
@@ -91,6 +375,9 @@ class OrderbookWatch(object):
             self.db.execute("CREATE INDEX fidelitybond_sources_directory_refresh "
                             "ON fidelitybond_sources(directory, active, "
                             "last_refresh_id);")
+            self.db.execute("CREATE INDEX "
+                            "fidelitybond_sources_active_last_seen "
+                            "ON fidelitybond_sources(active, last_seen_at);")
             self.db.execute("CREATE INDEX directory_peers_status_directory "
                             "ON directory_peers(status, directory);")
             self.db.execute("CREATE VIEW visible_orderbook AS "
@@ -127,6 +414,9 @@ class OrderbookWatch(object):
 
     def set_current_refresh_id(self, refresh_id):
         self.current_refresh_id = refresh_id
+
+    def on_valid_orderbook_response(self, source_directory, response_type):
+        pass
 
     @staticmethod
     def _make_initial_refresh_id():
@@ -309,7 +599,24 @@ class OrderbookWatch(object):
              "(?, ?, ?, ?, ?, ?, ?, ?);"),
             (counterparty, oid, directory, first_seen_at, now,
              refresh_id, 1, None))
+        self._refresh_active_order_sources_locked(counterparty, oid, now)
         self._mark_visibility_cache_dirty_locked()
+
+    def _refresh_active_order_sources_locked(self, counterparty, oid, now):
+        self.db.execute(
+            ("SELECT directory FROM orderbook_sources WHERE counterparty=? "
+             "AND oid=? AND active=1;"),
+            (counterparty, oid))
+        directories = [row["directory"] for row in self.db.fetchall()]
+        for directory in directories:
+            refresh_id = self._get_or_create_directory_refresh_id_locked(
+                directory)
+            self.db.execute(
+                ("UPDATE orderbook_sources SET last_seen_at=?, "
+                 "last_refresh_id=?, inactive_at=NULL "
+                 "WHERE counterparty=? AND oid=? AND directory=? "
+                 "AND active=1;"),
+                (now, refresh_id, counterparty, oid, directory))
 
     def _deactivate_order_source_locked(self, counterparty, oid, directory,
                                         now):
@@ -529,30 +836,56 @@ class OrderbookWatch(object):
              "(?, ?, ?, ?, ?, ?, ?);"),
             (counterparty, directory, first_seen_at, now,
              refresh_id, 1, None))
+        self._refresh_active_fidelitybond_sources_locked(counterparty, now)
         self._mark_visibility_cache_dirty_locked()
+
+    def _refresh_active_fidelitybond_sources_locked(self, counterparty, now):
+        self.db.execute(
+            ("SELECT directory FROM fidelitybond_sources WHERE "
+             "counterparty=? AND active=1;"),
+            (counterparty,))
+        directories = [row["directory"] for row in self.db.fetchall()]
+        for directory in directories:
+            refresh_id = self._get_or_create_directory_refresh_id_locked(
+                directory)
+            self.db.execute(
+                ("UPDATE fidelitybond_sources SET last_seen_at=?, "
+                 "last_refresh_id=?, inactive_at=NULL "
+                 "WHERE counterparty=? AND directory=? AND active=1;"),
+                (now, refresh_id, counterparty, directory))
 
     def prune_unseen_sources_for_directories(self, directories, refresh_id):
         directories = [d for d in directories if d]
         if not directories:
             return
-        now = self._now()
+        log.debug("Ignoring refresh-id source prune for directories {} "
+                  "and refresh id {}; TTL prune is authoritative.".format(
+                      ",".join(directories), refresh_id))
+        self.prune_sources()
+
+    def prune_stale_sources(self, offer_ttl_seconds,
+                            fidelitybond_ttl_seconds, now=None):
+        now = self._now() if now is None else now
         try:
             self.dblock.acquire(True)
-            for directory in directories:
+            dirty = False
+            if offer_ttl_seconds > 0:
                 self.db.execute(
                     ("UPDATE orderbook_sources SET active=0, "
                      "inactive_at=COALESCE(inactive_at, ?) "
-                     "WHERE directory=? AND active=1 AND "
-                     "last_refresh_id != ?;"),
-                    (now, directory, refresh_id))
+                     "WHERE active=1 AND last_seen_at < ?;"),
+                    (now, now - int(offer_ttl_seconds)))
+                dirty = dirty or self.db.rowcount > 0
+            if fidelitybond_ttl_seconds > 0:
                 self.db.execute(
                     ("UPDATE fidelitybond_sources SET active=0, "
                      "inactive_at=COALESCE(inactive_at, ?) "
-                     "WHERE directory=? AND active=1 AND "
-                     "last_refresh_id != ?;"),
-                    (now, directory, refresh_id))
+                     "WHERE active=1 AND last_seen_at < ?;"),
+                    (now, now - int(fidelitybond_ttl_seconds)))
+                dirty = dirty or self.db.rowcount > 0
             self._prune_sources_locked(now)
-            self._mark_visibility_cache_dirty_locked()
+            if dirty:
+                self._mark_visibility_cache_dirty_locked()
         finally:
             self.dblock.release()
 
@@ -614,6 +947,47 @@ class OrderbookWatch(object):
         finally:
             self.dblock.release()
 
+    def get_directory_runtime_liquidity(self, connected_directories=None):
+        connected_directories = set(connected_directories or [])
+        result = {
+            directory: {
+                "directory": directory,
+                "orderbook_size": 0,
+                "fidelitybond_size": 0,
+            }
+            for directory in connected_directories
+        }
+        try:
+            self.dblock.acquire(True)
+            self.db.execute(
+                "SELECT directory, COUNT(*) AS size FROM orderbook_sources "
+                "WHERE active=1 GROUP BY directory;")
+            for row in self.db.fetchall():
+                directory = row["directory"]
+                if connected_directories and directory not in result:
+                    continue
+                result.setdefault(directory, {
+                    "directory": directory,
+                    "orderbook_size": 0,
+                    "fidelitybond_size": 0,
+                })["orderbook_size"] = row["size"]
+            self.db.execute(
+                "SELECT directory, COUNT(*) AS size "
+                "FROM fidelitybond_sources WHERE active=1 "
+                "GROUP BY directory;")
+            for row in self.db.fetchall():
+                directory = row["directory"]
+                if connected_directories and directory not in result:
+                    continue
+                result.setdefault(directory, {
+                    "directory": directory,
+                    "orderbook_size": 0,
+                    "fidelitybond_size": 0,
+                })["fidelitybond_size"] = row["size"]
+            return list(result.values())
+        finally:
+            self.dblock.release()
+
     @staticmethod
     def on_set_topic(newtopic):
         chunks = newtopic.split('|')
@@ -635,6 +1009,7 @@ class OrderbookWatch(object):
 
     def on_order_seen(self, counterparty, oid, ordertype, minsize, maxsize,
                       txfee, cjfee, source_directory=None):
+        valid_source_directory = None
         try:
             self.dblock.acquire(True)
             if int(oid) < 0 or int(oid) > sys.maxsize:
@@ -698,6 +1073,7 @@ class OrderbookWatch(object):
                 (counterparty, oid, ordertype, minsize, maxsize, txfee,
                  cjfee))  # any parseable Decimal is a valid cjfee
             self._mark_visibility_cache_dirty_locked()
+            valid_source_directory = source_directory
         except InvalidOperation:
             log.debug("Got invalid cjfee: " + str(cjfee) + " from " + counterparty)
         except Exception as e:
@@ -705,6 +1081,13 @@ class OrderbookWatch(object):
             log.debug("Exception was: " + repr(e))
         finally:
             self.dblock.release()
+        if valid_source_directory:
+            try:
+                self.on_valid_orderbook_response(
+                    valid_source_directory, "offer")
+            except Exception as e:
+                log.warning("Orderbook response hook failed for {}: {}".format(
+                    valid_source_directory, repr(e)))
 
     def on_order_cancel(self, counterparty, oid, source_directory=None):
         try:
@@ -733,6 +1116,7 @@ class OrderbookWatch(object):
             log.debug("Failed to verify fidelity bond for {}, skipping."
                       .format(maker_nick))
             return
+        valid_source_directory = None
         try:
             self.dblock.acquire(True)
             if source_directory:
@@ -743,8 +1127,16 @@ class OrderbookWatch(object):
             self.db.execute("INSERT OR REPLACE INTO fidelitybonds VALUES(?, ?, ?);",
                 (nick, taker_nick, fidelity_bond_proof_msg))
             self._mark_visibility_cache_dirty_locked()
+            valid_source_directory = source_directory
         finally:
             self.dblock.release()
+        if valid_source_directory:
+            try:
+                self.on_valid_orderbook_response(
+                    valid_source_directory, "fidelitybond")
+            except Exception as e:
+                log.warning("Fidelity-bond response hook failed for {}: {}"
+                            .format(valid_source_directory, repr(e)))
 
     def on_nick_leave(self, nick, source_directory=None):
         try:
