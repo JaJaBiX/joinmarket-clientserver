@@ -39,6 +39,10 @@ def get_direct_visible_orderbook_rows(ob):
     return [dict(row) for row in
             ob.db.execute('SELECT * FROM visible_orderbook;').fetchall()]
 
+def get_refresh_row(store, directory):
+    return [r for r in store.get_rows()
+            if r["directory"] == directory][0]
+
 def test_refresh_state_store_selects_due_dn_by_runtime_liquidity(tmp_path):
     store = RefreshStateStore(str(tmp_path / "refresh.sqlite3"))
     try:
@@ -63,8 +67,7 @@ def test_refresh_state_store_selects_due_dn_by_runtime_liquidity(tmp_path):
         assert selected["directory"] == "dn-small.onion:5222"
 
         store.record_response("dn-large.onion:5222", "offer", now + 20)
-        row = [r for r in store.get_rows()
-               if r["directory"] == "dn-large.onion:5222"][0]
+        row = get_refresh_row(store, "dn-large.onion:5222")
         assert row["last_successful_refresh_at"] == now + 20
         assert row["current_generation_offer_count"] == 1
         assert row["consecutive_missing_count"] == 0
@@ -93,6 +96,78 @@ def test_refresh_state_store_accounts_missing_generation_once(tmp_path):
         row = store.get_rows()[0]
         assert row["consecutive_missing_count"] == 0
         assert row["current_generation_fidelitybond_count"] == 1
+    finally:
+        store.close()
+
+def test_refresh_state_store_passive_response_does_not_satisfy_refresh(
+        tmp_path):
+    store = RefreshStateStore(str(tmp_path / "refresh.sqlite3"))
+    try:
+        store.mark_due_connected_directories(["dn-passive.onion:5222"],
+                                             900, 100, reset_fresh=True)
+        store.record_response("dn-passive.onion:5222", "offer", 120)
+
+        row = get_refresh_row(store, "dn-passive.onion:5222")
+        assert row["last_response_at"] == 120
+        assert row["response_count"] == 1
+        assert row["need_refresh"] == 1
+        assert row["last_successful_refresh_at"] is None
+        assert row["current_generation_offer_count"] == 0
+
+        selected = store.select_next_refresh([
+            {"directory": "dn-passive.onion:5222", "orderbook_size": 10,
+             "fidelitybond_size": 2},
+        ], 121)
+        assert selected["directory"] == "dn-passive.onion:5222"
+    finally:
+        store.close()
+
+def test_refresh_state_store_passive_response_does_not_hide_stale_success(
+        tmp_path):
+    store = RefreshStateStore(str(tmp_path / "refresh.sqlite3"))
+    try:
+        store.mark_due_connected_directories(["dn-target.onion:5222"],
+                                             900, 100)
+        store.record_request("dn-target.onion:5222", "refresh-1", 600, 100)
+        store.record_response("dn-target.onion:5222", "offer", 120)
+        row = get_refresh_row(store, "dn-target.onion:5222")
+        assert row["need_refresh"] == 0
+        assert row["last_successful_refresh_at"] == 120
+
+        store.mark_due_connected_directories(["dn-target.onion:5222"],
+                                             900, 1100)
+        row = get_refresh_row(store, "dn-target.onion:5222")
+        assert row["need_refresh"] == 1
+
+        store.record_response("dn-target.onion:5222", "offer", 1110)
+        row = get_refresh_row(store, "dn-target.onion:5222")
+        assert row["need_refresh"] == 1
+        assert row["last_successful_refresh_at"] == 120
+        assert row["current_generation_offer_count"] == 2
+    finally:
+        store.close()
+
+def test_refresh_state_store_repairs_passive_success_without_request(tmp_path):
+    db_path = str(tmp_path / "refresh.sqlite3")
+    store = RefreshStateStore(db_path)
+    try:
+        store.mark_due_connected_directories(["dn-passive.onion:5222"],
+                                             900, 100, reset_fresh=True)
+        with store.lock:
+            store.con.execute(
+                "UPDATE directory_peers_refresh SET need_refresh=0, "
+                "current_generation_offer_count=7, "
+                "last_successful_refresh_at=120 "
+                "WHERE directory='dn-passive.onion:5222';")
+    finally:
+        store.close()
+
+    store = RefreshStateStore(db_path)
+    try:
+        row = get_refresh_row(store, "dn-passive.onion:5222")
+        assert row["need_refresh"] == 1
+        assert row["current_generation_offer_count"] == 0
+        assert row["last_successful_refresh_at"] is None
     finally:
         store.close()
 

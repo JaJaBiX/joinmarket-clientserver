@@ -38,6 +38,7 @@ class RefreshStateStore(object):
             self.con.close()
 
     def _migrate(self):
+        now = self._now()
         with self.lock:
             self.con.execute("BEGIN IMMEDIATE;")
             try:
@@ -66,6 +67,21 @@ class RefreshStateStore(object):
                     "directory_peers_refresh_due "
                     "ON directory_peers_refresh(need_refresh, "
                     "cooldown_time);")
+                self.con.execute(
+                    "UPDATE directory_peers_refresh SET "
+                    "need_refresh=1, "
+                    "current_refresh_id=NULL, "
+                    "current_generation_offer_count=0, "
+                    "current_generation_fidelitybond_count=0, "
+                    "last_successful_refresh_at=NULL, "
+                    "last_missing_accounted_request_at=NULL, "
+                    "updated_at=? "
+                    "WHERE last_request_at IS NULL AND ("
+                    "need_refresh=0 OR current_refresh_id IS NOT NULL OR "
+                    "current_generation_offer_count != 0 OR "
+                    "current_generation_fidelitybond_count != 0 OR "
+                    "last_successful_refresh_at IS NOT NULL);",
+                    (now,))
                 self.con.execute("COMMIT;")
             except Exception:
                 self.con.execute("ROLLBACK;")
@@ -220,6 +236,9 @@ class RefreshStateStore(object):
                 self._account_missing_generation_locked(directory, now)
                 self.con.execute(
                     "UPDATE directory_peers_refresh SET need_refresh=1, "
+                    "current_refresh_id=NULL, "
+                    "current_generation_offer_count=0, "
+                    "current_generation_fidelitybond_count=0, "
                     "updated_at=? WHERE directory=?;",
                     (now, directory))
                 self.con.execute("COMMIT;")
@@ -237,21 +256,55 @@ class RefreshStateStore(object):
             self.con.execute("BEGIN IMMEDIATE;")
             try:
                 self._ensure_directory_locked(directory, now)
-                self.con.execute(
-                    "UPDATE directory_peers_refresh SET "
-                    "last_response_at=?, "
-                    "last_successful_refresh_at=?, "
-                    "need_refresh=0, "
-                    "current_generation_offer_count="
-                    "current_generation_offer_count + ?, "
-                    "current_generation_fidelitybond_count="
-                    "current_generation_fidelitybond_count + ?, "
-                    "response_count=response_count + 1, "
-                    "consecutive_missing_count=0, "
-                    "last_missing_accounted_request_at=NULL, "
-                    "updated_at=? WHERE directory=?;",
-                    (now, now, offer_increment, fidelitybond_increment, now,
-                     directory))
+                cur = self.con.execute(
+                    "SELECT current_refresh_id, last_request_at, "
+                    "last_successful_refresh_at "
+                    "FROM directory_peers_refresh WHERE directory=?;",
+                    (directory,))
+                row = cur.fetchone()
+                has_current_request = bool(
+                    row and row["current_refresh_id"] and
+                    row["last_request_at"] is not None)
+                first_response_for_request = bool(
+                    has_current_request and
+                    (row["last_successful_refresh_at"] is None or
+                     row["last_successful_refresh_at"] <
+                     row["last_request_at"]))
+                if first_response_for_request:
+                    self.con.execute(
+                        "UPDATE directory_peers_refresh SET "
+                        "last_response_at=?, "
+                        "last_successful_refresh_at=?, "
+                        "need_refresh=0, "
+                        "current_generation_offer_count="
+                        "current_generation_offer_count + ?, "
+                        "current_generation_fidelitybond_count="
+                        "current_generation_fidelitybond_count + ?, "
+                        "response_count=response_count + 1, "
+                        "consecutive_missing_count=0, "
+                        "last_missing_accounted_request_at=NULL, "
+                        "updated_at=? WHERE directory=?;",
+                        (now, now, offer_increment, fidelitybond_increment,
+                         now, directory))
+                elif has_current_request:
+                    self.con.execute(
+                        "UPDATE directory_peers_refresh SET "
+                        "last_response_at=?, "
+                        "current_generation_offer_count="
+                        "current_generation_offer_count + ?, "
+                        "current_generation_fidelitybond_count="
+                        "current_generation_fidelitybond_count + ?, "
+                        "response_count=response_count + 1, "
+                        "updated_at=? WHERE directory=?;",
+                        (now, offer_increment, fidelitybond_increment, now,
+                         directory))
+                else:
+                    self.con.execute(
+                        "UPDATE directory_peers_refresh SET "
+                        "last_response_at=?, "
+                        "response_count=response_count + 1, "
+                        "updated_at=? WHERE directory=?;",
+                        (now, now, directory))
                 self.con.execute("COMMIT;")
             except Exception:
                 self.con.execute("ROLLBACK;")
