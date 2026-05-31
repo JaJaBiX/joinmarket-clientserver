@@ -887,7 +887,7 @@ class ObBasic(OrderbookWatch):
         self.httpd_thread_started = False
         self.orderbook_refresh_thread_started = False
         self.orderbook_request_interval = self.read_int_env(
-            'JM_OBWATCH_ORDERBOOK_REQUEST_INTERVAL_SECONDS', 360)
+            'JM_OBWATCH_ORDERBOOK_REQUEST_INTERVAL_SECONDS', 180)
         self.directory_refresh_target_seconds = self.read_int_env(
             'JM_OBWATCH_DN_REFRESH_TARGET_SECONDS', 900)
         self.directory_cooldown_seconds = self.read_int_env(

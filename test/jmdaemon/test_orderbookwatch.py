@@ -43,34 +43,80 @@ def get_refresh_row(store, directory):
     return [r for r in store.get_rows()
             if r["directory"] == directory][0]
 
-def test_refresh_state_store_selects_due_dn_by_runtime_liquidity(tmp_path):
+def test_refresh_state_store_selects_oldest_successful_refresh_not_largest_runtime(
+        tmp_path):
     store = RefreshStateStore(str(tmp_path / "refresh.sqlite3"))
     try:
-        now = 1000
+        now = 2000
         store.mark_due_connected_directories(
-            ["dn-small.onion:5222", "dn-large.onion:5222"], 900, now)
+            ["dn-small-stale.onion:5222", "dn-large-newer.onion:5222"],
+            900, 0)
+        store.record_request("dn-small-stale.onion:5222",
+                             "refresh-small-old", 0, 100)
+        store.record_response("dn-small-stale.onion:5222", "offer", 110)
+        store.record_request("dn-large-newer.onion:5222",
+                             "refresh-large-newer", 0, 1000)
+        store.record_response("dn-large-newer.onion:5222", "offer", 1010)
+        store.mark_due_connected_directories(
+            ["dn-small-stale.onion:5222", "dn-large-newer.onion:5222"],
+            900, now)
+
         selected = store.select_next_refresh([
-            {"directory": "dn-small.onion:5222", "orderbook_size": 2,
+            {"directory": "dn-small-stale.onion:5222", "orderbook_size": 1,
              "fidelitybond_size": 0},
-            {"directory": "dn-large.onion:5222", "orderbook_size": 5,
-             "fidelitybond_size": 1},
+            {"directory": "dn-large-newer.onion:5222",
+             "orderbook_size": 1000, "fidelitybond_size": 500},
         ], now)
-        assert selected["directory"] == "dn-large.onion:5222"
+        assert selected["directory"] == "dn-small-stale.onion:5222"
+        assert selected["orderbook_size"] == 1
 
-        store.record_request("dn-large.onion:5222", "refresh-large", 600, now)
+        store.record_request("dn-small-stale.onion:5222",
+                             "refresh-small-current", 600, now)
         selected = store.select_next_refresh([
-            {"directory": "dn-small.onion:5222", "orderbook_size": 2,
+            {"directory": "dn-small-stale.onion:5222", "orderbook_size": 1,
              "fidelitybond_size": 0},
-            {"directory": "dn-large.onion:5222", "orderbook_size": 5,
-             "fidelitybond_size": 1},
+            {"directory": "dn-large-newer.onion:5222",
+             "orderbook_size": 1000, "fidelitybond_size": 500},
         ], now + 10)
-        assert selected["directory"] == "dn-small.onion:5222"
+        assert selected["directory"] == "dn-large-newer.onion:5222"
 
-        store.record_response("dn-large.onion:5222", "offer", now + 20)
-        row = get_refresh_row(store, "dn-large.onion:5222")
+        store.record_response("dn-small-stale.onion:5222", "offer", now + 20)
+        row = get_refresh_row(store, "dn-small-stale.onion:5222")
         assert row["last_successful_refresh_at"] == now + 20
         assert row["current_generation_offer_count"] == 1
         assert row["consecutive_missing_count"] == 0
+    finally:
+        store.close()
+
+def test_refresh_state_store_selects_never_successful_passive_dn_before_larger_runtime(
+        tmp_path):
+    store = RefreshStateStore(str(tmp_path / "refresh.sqlite3"))
+    try:
+        now = 1100
+        store.mark_due_connected_directories(
+            ["dn-passive.onion:5222", "dn-large-success.onion:5222"],
+            900, 100, reset_fresh=True)
+        store.record_response("dn-passive.onion:5222", "offer", 120)
+        store.record_request("dn-large-success.onion:5222",
+                             "refresh-large", 0, 130)
+        store.record_response("dn-large-success.onion:5222", "offer", 140)
+        store.mark_due_connected_directories(
+            ["dn-passive.onion:5222", "dn-large-success.onion:5222"],
+            900, now)
+
+        selected = store.select_next_refresh([
+            {"directory": "dn-passive.onion:5222", "orderbook_size": 0,
+             "fidelitybond_size": 0},
+            {"directory": "dn-large-success.onion:5222",
+             "orderbook_size": 1000, "fidelitybond_size": 500},
+        ], now)
+        assert selected["directory"] == "dn-passive.onion:5222"
+
+        row = get_refresh_row(store, "dn-passive.onion:5222")
+        assert row["need_refresh"] == 1
+        assert row["request_count"] == 0
+        assert row["response_count"] == 1
+        assert row["last_successful_refresh_at"] is None
     finally:
         store.close()
 

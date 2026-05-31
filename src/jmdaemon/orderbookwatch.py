@@ -335,8 +335,7 @@ class RefreshStateStore(object):
             "WHERE dpr.need_refresh = 1 "
             "AND COALESCE(dpr.cooldown_time, 0) < ? "
             "ORDER BY COALESCE(dpr.consecutive_missing_count, 0) ASC, "
-            "runtime.orderbook_size DESC, "
-            "runtime.fidelitybond_size DESC, "
+            "COALESCE(dpr.last_successful_refresh_at, 0) ASC, "
             "COALESCE(dpr.last_request_at, 0) ASC, "
             "dpr.directory ASC LIMIT 1;")
         with self.lock:
